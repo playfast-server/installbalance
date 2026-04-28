@@ -1,8 +1,11 @@
 #!/bin/bash
 ###############################################################################
 #  XUI.One CPU Affinity Setter
-#  Lê isolcpus= e irqaffinity= de /etc/default/grub, subtrai os cores de
-#  housekeeping do range isolado, e seta CPUAffinity= no service do XUI.One.
+#  Lógica:
+#    - isolcpus + irqaffinity → usa isolcpus menos housekeeping
+#    - isolcpus sem irqaffinity → usa isolcpus inteiro
+#    - sem isolcpus, com irqaffinity → usa todos os CPUs menos housekeeping
+#    - sem isolcpus e sem irqaffinity → usa todos os CPUs (0-N)
 ###############################################################################
 
 set -euo pipefail
@@ -123,6 +126,17 @@ strip_isolcpus_flags() {
     echo "$range"
 }
 
+# Normalizar range: ordena, remove duplicatas, compacta hífens
+# "5,3,3,4,2-2" → "2-5"
+canonicalize_range() {
+    local range="$1"
+    [[ -z "$range" ]] && return
+    local expanded
+    expanded=$(expand_range "$range")
+    [[ -z "$expanded" ]] && return
+    compact_range "$expanded"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Verificações iniciais
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,17 +156,21 @@ if [[ ! -f "$SERVICE_FILE" ]]; then
     exit 1
 fi
 
-if ! grep -q '^\[Service\]' "$SERVICE_FILE"; then
+if ! grep -qE '^[[:space:]]*\[Service\][[:space:]]*$' "$SERVICE_FILE"; then
     log_error "Service file não contém seção [Service]: ${SERVICE_FILE}"
     exit 1
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ler isolcpus= e irqaffinity= de /etc/default/grub
+# Ignora linhas comentadas e concatena GRUB_CMDLINE_LINUX_DEFAULT + LINUX
+# Em caso de múltiplas ocorrências do mesmo parâmetro, usa a ÚLTIMA
+# (kernel cmdline behavior: last wins)
 # ─────────────────────────────────────────────────────────────────────────────
 CMDLINE=""
 for var in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
-    line=$(grep -E "^[[:space:]]*${var}=" "$GRUB_FILE" || true)
+    # ^[[:space:]]*${var}= → exclui linhas comentadas (# no início)
+    line=$(grep -E "^[[:space:]]*${var}=" "$GRUB_FILE" | tail -1 || true)
     if [[ -n "$line" ]]; then
         # Extrair conteúdo entre aspas (suporta " e ')
         value=$(echo "$line" | sed -E "s/^[[:space:]]*${var}=//; s/^['\"]//; s/['\"][[:space:]]*$//")
@@ -165,71 +183,96 @@ if [[ -z "$CMDLINE" ]]; then
     exit 1
 fi
 
-ISOLCPUS_RAW=$(echo "$CMDLINE" | grep -oE 'isolcpus=[^ ]+' || true)
-IRQAFF_RAW=$(echo "$CMDLINE" | grep -oE 'irqaffinity=[^ ]+' || true)
-
-if [[ -z "$ISOLCPUS_RAW" ]]; then
-    log_error "isolcpus= não encontrado em ${GRUB_FILE}"
-    exit 1
-fi
-
-# Limpar prefixos: isolcpus=managed_irq,domain,2-15,34-47 → 2-15,34-47
-ISOLATED_RANGE=$(strip_isolcpus_flags "$ISOLCPUS_RAW")
-
-if [[ -z "$ISOLATED_RANGE" ]] || ! [[ "$ISOLATED_RANGE" =~ ^[0-9,-]+$ ]]; then
-    log_error "Range isolcpus inválido após parse: '${ISOLATED_RANGE}'"
-    exit 1
-fi
-
-log_info "Range isolcpus: ${ISOLATED_RANGE}"
+# tail -1 garante "última ocorrência ganha" se param aparece em ambas as linhas
+ISOLCPUS_RAW=$(echo "$CMDLINE" | grep -oE 'isolcpus=[^ ]+' | tail -1 || true)
+IRQAFF_RAW=$(echo "$CMDLINE" | grep -oE 'irqaffinity=[^ ]+' | tail -1 || true)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Subtrair housekeeping (irqaffinity=) do range
+# Determinar range base (isolcpus ou todos os CPUs)
 # ─────────────────────────────────────────────────────────────────────────────
-HK_RANGE=""
+MAX_CPU=$(( $(nproc) - 1 ))
+ALL_CPUS="0-${MAX_CPU}"
+
+if [[ -n "$ISOLCPUS_RAW" ]]; then
+    # Limpar prefixos: isolcpus=managed_irq,domain,2-15,34-47 → 2-15,34-47
+    BASE_RANGE=$(strip_isolcpus_flags "$ISOLCPUS_RAW")
+
+    if [[ -z "$BASE_RANGE" ]] || ! [[ "$BASE_RANGE" =~ ^[0-9,-]+$ ]]; then
+        log_error "Range isolcpus inválido após parse: '${BASE_RANGE}'"
+        exit 1
+    fi
+
+    # Normalizar (ordenar, dedup, compactar)
+    BASE_RANGE=$(canonicalize_range "$BASE_RANGE")
+    if [[ -z "$BASE_RANGE" ]]; then
+        log_error "Range isolcpus vazio após canonicalização"
+        exit 1
+    fi
+
+    log_info "isolcpus detectado — range base: ${BASE_RANGE}"
+else
+    BASE_RANGE="$ALL_CPUS"
+    log_info "isolcpus não detectado — usando todos os CPUs: ${BASE_RANGE}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subtrair housekeeping (irqaffinity=) do range, se existir
+# ─────────────────────────────────────────────────────────────────────────────
+FINAL_RANGE="$BASE_RANGE"
+
 if [[ -n "$IRQAFF_RAW" ]]; then
     HK_RANGE="${IRQAFF_RAW#irqaffinity=}"
     if [[ -n "$HK_RANGE" ]] && [[ "$HK_RANGE" =~ ^[0-9,-]+$ ]]; then
-        log_info "Range housekeeping: ${HK_RANGE}"
+        log_info "Housekeeping (irqaffinity): ${HK_RANGE} — será ignorado"
 
-        FILTERED_RANGE=$(subtract_range "$ISOLATED_RANGE" "$HK_RANGE")
+        FILTERED_RANGE=$(subtract_range "$BASE_RANGE" "$HK_RANGE")
 
-        if [[ "$FILTERED_RANGE" != "$ISOLATED_RANGE" ]]; then
-            log_warn "Cores housekeeping detectados em isolcpus — filtrando"
-            ISOLATED_RANGE="$FILTERED_RANGE"
+        if [[ -z "$FILTERED_RANGE" ]]; then
+            log_error "Range vazio após filtrar housekeeping"
+            exit 1
         fi
-    fi
-fi
 
-if [[ -z "$ISOLATED_RANGE" ]]; then
-    log_error "Range vazio após filtrar housekeeping"
-    exit 1
+        FINAL_RANGE="$FILTERED_RANGE"
+    else
+        log_warn "irqaffinity= presente mas inválido: '${HK_RANGE}'"
+    fi
+else
+    log_info "Sem irqaffinity — usando range base sem filtro"
 fi
 
 # Validar contra CPUs disponíveis
-MAX_CPU=$(( $(nproc) - 1 ))
-HIGHEST_CPU=$(echo "$ISOLATED_RANGE" | tr ',' '\n' | tr '-' '\n' | sort -n | tail -1)
+HIGHEST_CPU=$(echo "$FINAL_RANGE" | tr ',' '\n' | tr '-' '\n' | sort -n | tail -1)
 if [[ -n "$HIGHEST_CPU" ]] && [[ "$HIGHEST_CPU" -gt "$MAX_CPU" ]]; then
     log_error "Range referencia CPU ${HIGHEST_CPU}, mas sistema só tem CPUs 0-${MAX_CPU}"
     exit 1
 fi
 
-log_ok "CPUAffinity final: ${ISOLATED_RANGE}"
+log_ok "CPUAffinity final: ${FINAL_RANGE}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Editar o service file
 # ─────────────────────────────────────────────────────────────────────────────
 SERVICE_DIR=$(dirname "$SERVICE_FILE")
 TMP_FILE=$(mktemp -p "$SERVICE_DIR" .xuione.service.tmp.XXXXXX)
+BACKUP_FILE=""
 trap 'rm -f "$TMP_FILE"' EXIT INT TERM HUP
 
-awk -v new_line="CPUAffinity=${ISOLATED_RANGE}" '
-    /^[[:space:]]*CPUAffinity[[:space:]]*=/ { next }
+# awk seção-aware: só remove/insere CPUAffinity dentro de [Service]
+# - Detecta entrada/saída da seção via headers [...]
+# - Remove CPUAffinity= existente APENAS dentro de [Service]
+# - Insere nova CPUAffinity logo após o header [Service]
+awk -v new_line="CPUAffinity=${FINAL_RANGE}" '
+    /^[[:space:]]*\[.*\][[:space:]]*$/ {
+        in_service = ($0 ~ /^[[:space:]]*\[Service\][[:space:]]*$/)
+        print
+        if (in_service) print new_line
+        next
+    }
+    in_service && /^[[:space:]]*CPUAffinity[[:space:]]*=/ { next }
     { print }
-    /^\[Service\][[:space:]]*$/ { print new_line }
 ' "$SERVICE_FILE" > "$TMP_FILE"
 
-if ! grep -q "^CPUAffinity=${ISOLATED_RANGE}$" "$TMP_FILE"; then
+if ! grep -q "^CPUAffinity=${FINAL_RANGE}$" "$TMP_FILE"; then
     log_error "Falha ao inserir CPUAffinity no service file"
     exit 1
 fi
@@ -240,20 +283,38 @@ if cmp -s "$TMP_FILE" "$SERVICE_FILE"; then
     exit 0
 fi
 
+# Backup antes de aplicar
+BACKUP_FILE="${SERVICE_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+cp -p "$SERVICE_FILE" "$BACKUP_FILE"
+log_info "Backup criado: ${BACKUP_FILE}"
+
 # Aplicar (atômico via mv no mesmo filesystem)
 chown --reference="$SERVICE_FILE" "$TMP_FILE"
 chmod --reference="$SERVICE_FILE" "$TMP_FILE"
 mv "$TMP_FILE" "$SERVICE_FILE"
-log_ok "Service file atualizado: CPUAffinity=${ISOLATED_RANGE}"
+log_ok "Service file atualizado: CPUAffinity=${FINAL_RANGE}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reload + restart
+# Reload + restart com rollback em caso de falha
 # ─────────────────────────────────────────────────────────────────────────────
+rollback() {
+    log_warn "Restaurando service file do backup..."
+    if [[ -f "$BACKUP_FILE" ]]; then
+        mv "$BACKUP_FILE" "$SERVICE_FILE"
+        systemctl daemon-reload
+        log_warn "Rollback concluído — service file restaurado"
+    fi
+}
+
 systemctl daemon-reload
 log_ok "daemon-reload executado"
 
 if systemctl is-active --quiet xuione.service; then
-    systemctl restart xuione.service
+    if ! systemctl restart xuione.service; then
+        log_error "systemctl restart falhou"
+        rollback
+        exit 1
+    fi
     log_ok "xuione.service reiniciado"
 
     sleep 1
@@ -262,6 +323,8 @@ if systemctl is-active --quiet xuione.service; then
     else
         log_error "xuione.service NÃO está rodando após restart"
         journalctl -u xuione.service -n 20 --no-pager 2>/dev/null || true
+        rollback
+        systemctl restart xuione.service 2>/dev/null || true
         exit 1
     fi
 else
