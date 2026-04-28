@@ -14,6 +14,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 NIC=""
 HOUSEKEEPING_OVERRIDE=""
+NO_HOUSEKEEPING=0
 
 show_usage() {
     cat <<USAGE
@@ -27,6 +28,10 @@ OPÇÕES:
   --housekeeping <N>         (Opcional) Override do número de threads para
                              housekeeping. Default: 1/2/2/4/8 conforme escala
                              do NUMA (≤8/9-16/17-32/33-64/>64 threads).
+  --no-housekeeping          Reserva apenas 1 CPU (o primeiro do NUMA da NIC)
+                             para o sistema, todos os outros cores ficam
+                             disponíveis para a aplicação. Útil quando o
+                             servidor é dedicado (sem MySQL etc).
   --help                     Mostra esta mensagem.
 
 EXEMPLOS:
@@ -38,6 +43,9 @@ EXEMPLOS:
 
   # Override do count de housekeeping:
   $0 --nic enp1s0f0 --housekeeping 4
+
+  # Apenas 1 CPU para sistema (servidor dedicado, sem MySQL):
+  $0 --nic enp1s0f0 --no-housekeeping
 
 USAGE
 }
@@ -60,6 +68,10 @@ while [[ $# -gt 0 ]]; do
             HOUSEKEEPING_OVERRIDE="$2"
             shift 2
             ;;
+        --no-housekeeping)
+            NO_HOUSEKEEPING=1
+            shift
+            ;;
         --help|-h)
             show_usage
             exit 0
@@ -71,6 +83,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validar combinações mutuamente exclusivas
+if [[ "$NO_HOUSEKEEPING" -eq 1 ]] && [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
+    echo "Erro: --no-housekeeping e --housekeeping são mutuamente exclusivos" >&2
+    exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cores e formatação
@@ -763,6 +781,7 @@ NUMA_CPULIST=""
 NUMA_THREAD_COUNT=""
 HK_COUNT=""
 REMOTE_NUMAS=""
+FIRST_CPU=""
 
 if [[ -n "$NIC" ]]; then
     log_section "ISOLATION NUMA-AWARE — análise da topologia"
@@ -776,8 +795,11 @@ if [[ -n "$NIC" ]]; then
     NUMA_THREAD_COUNT=$(count_threads_in_range "$NUMA_CPULIST")
     log_info "Threads no NUMA ${NIC_NUMA}: ${NUMA_CPULIST} (total: ${NUMA_THREAD_COUNT})"
 
-    # Determinar housekeeping count (override ou heurística)
-    if [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
+    # Determinar housekeeping count (override, no-housekeeping, ou heurística)
+    if [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
+        HK_COUNT=1
+        log_info "Modo --no-housekeeping: apenas 1 CPU (primeiro do NUMA ${NIC_NUMA}) reservado para o sistema"
+    elif [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
         if ! [[ "$HOUSEKEEPING_OVERRIDE" =~ ^[0-9]+$ ]] || [[ "$HOUSEKEEPING_OVERRIDE" -lt 1 ]]; then
             log_error "--housekeeping deve ser um inteiro positivo (recebido: '$HOUSEKEEPING_OVERRIDE')"
             exit 1
@@ -796,8 +818,21 @@ if [[ -n "$NIC" ]]; then
     fi
 
     # Calcular conjuntos
-    HK_THREADS=$(select_housekeeping_threads "$NUMA_CPULIST" "$HK_COUNT")
-    ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "$HK_THREADS")
+    if [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
+        # Pegar o primeiro CPU do NUMA da NIC (não usa SMT sibling — sacrifica só 1 thread)
+        # Em single-NUMA isso é CPU 0; em multi-NUMA com NIC no NUMA 1 pode ser CPU 16, etc.
+        FIRST_CPU=$(expand_range "$NUMA_CPULIST" | awk '{print $1}')
+        if [[ -z "$FIRST_CPU" ]]; then
+            log_error "Não foi possível determinar primeiro CPU do NUMA ${NIC_NUMA}"
+            exit 1
+        fi
+        HK_THREADS="$FIRST_CPU"
+        ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "$FIRST_CPU")
+        log_info "--no-housekeeping: usando CPU ${FIRST_CPU} (primeiro do NUMA ${NIC_NUMA}) como housekeeping"
+    else
+        HK_THREADS=$(select_housekeeping_threads "$NUMA_CPULIST" "$HK_COUNT")
+        ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "$HK_THREADS")
+    fi
 
     # Validar: ambos os conjuntos devem ser não-vazios para produzir GRUB válido
     if [[ -z "$HK_THREADS" ]]; then
@@ -831,7 +866,12 @@ if [[ -n "$NIC" ]]; then
     ISOLATION_FLAGS+=" irqaffinity=${HK_THREADS}"
 
     EXTRA_NOTES+=("Isolation: cores ${ISOLATED_THREADS} do NUMA ${NIC_NUMA} dedicados à aplicação")
-    EXTRA_NOTES+=("Housekeeping: cores ${HK_THREADS} (NUMA ${NIC_NUMA}) absorvem IRQs residuais e kernel work")
+    if [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
+        EXTRA_NOTES+=("--no-housekeeping: APENAS CPU ${HK_THREADS} reservado — todas as IRQs residuais ficam nesse 1 CPU")
+        EXTRA_NOTES+=("ATENÇÃO: em alta carga, CPU ${HK_THREADS} pode virar gargalo de IRQ handling")
+    else
+        EXTRA_NOTES+=("Housekeeping: cores ${HK_THREADS} (NUMA ${NIC_NUMA}) absorvem IRQs residuais e kernel work")
+    fi
     [[ -n "$REMOTE_NUMAS" ]] && EXTRA_NOTES+=("NUMAs remotos livres para serviços não-críticos (PHP-FPM, MySQL, etc)")
 fi
 
