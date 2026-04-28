@@ -120,13 +120,10 @@ apt-get upgrade "${APT_OPTS[@]}"
 ########################################
 # 6.1) Instalar ferramentas básicas + dependências da blindagem
 ########################################
-echo "==> Instalando ferramentas básicas e dependências..."
+echo "==> Instalando ferramentas básicas..."
 apt-get install "${APT_OPTS[@]}" \
   nload htop net-tools wget gpg ca-certificates \
-  python3 python3-yaml iproute2 iputils-ping
-
-# Tenta ruamel.yaml (preserva formatação) - opcional
-apt-get install "${APT_OPTS[@]}" python3-ruamel.yaml >/dev/null 2>&1 || true
+  iproute2 iputils-ping
 
 ########################################
 # 7) Configurar repositório XanMod
@@ -297,138 +294,11 @@ EOF
 
   # ---- Camada 2a: Netplan ----
   if [ "$HAS_NETPLAN" = "1" ]; then
-    echo "   [2/3] Reescrevendo Netplan com match por MAC..."
-    python3 - "$NETPLAN_DIR" "${PHYSICAL_NICS[@]}" <<'PYEOF'
-import os, sys, glob, shutil
-
-try:
-    from ruamel.yaml import YAML
-    yaml_handler = YAML()
-    yaml_handler.preserve_quotes = True
-    yaml_handler.indent(mapping=2, sequence=4, offset=2)
-    USE_RUAMEL = True
-except ImportError:
-    import yaml as pyyaml
-    USE_RUAMEL = False
-
-netplan_dir = sys.argv[1]
-physical_nics = sys.argv[2:]
-
-nic_mac = {}
-for nic in physical_nics:
-    try:
-        with open(f"/sys/class/net/{nic}/address") as f:
-            nic_mac[nic] = f.read().strip().lower()
-    except FileNotFoundError:
-        pass
-
-def load(path):
-    with open(path) as f:
-        if USE_RUAMEL:
-            return yaml_handler.load(f)
-        return pyyaml.safe_load(f)
-
-def dump(data, path):
-    with open(path, 'w') as f:
-        if USE_RUAMEL:
-            yaml_handler.dump(data, f)
-        else:
-            pyyaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
-
-modified_count = 0
-for path in sorted(glob.glob(os.path.join(netplan_dir, "*.yaml")) +
-                   glob.glob(os.path.join(netplan_dir, "*.yml"))):
-    try:
-        data = load(path)
-    except Exception as e:
-        print(f"      [WARN] não foi possível parsear {path}: {e}", file=sys.stderr)
-        continue
-
-    if not data or 'network' not in data:
-        continue
-    net = data['network']
-    eth = net.get('ethernets')
-    if not eth:
-        continue
-
-    changed = False
-    for ifname in list(eth.keys()):
-        conf = eth[ifname]
-        if conf is None:
-            conf = {}
-            eth[ifname] = conf
-
-        existing_match = conf.get('match') if hasattr(conf, 'get') else None
-        if existing_match and 'macaddress' in existing_match:
-            continue
-
-        if ifname in nic_mac:
-            mac = nic_mac[ifname]
-            conf['match'] = {'macaddress': mac}
-            conf['set-name'] = ifname
-            changed = True
-            print(f"      {os.path.basename(path)}: {ifname} -> match macaddress {mac}")
-
-    if changed:
-        shutil.copy2(path, path + ".bak-prexanmod")
-        dump(data, path)
-        modified_count += 1
-
-print(f"      Netplan atualizado: {modified_count} arquivo(s)")
-PYEOF
-
-    # Validação Netplan
+    echo "   [2/3] Netplan detectado - validando configuração existente (sem alterar)..."
     if ! netplan generate 2>/tmp/netplan-err.log; then
-      echo "   ❌ netplan generate falhou:" >&2
-      cat /tmp/netplan-err.log >&2
-      false
+      echo "   ⚠️  netplan generate retornou erro (config existente):" >&2
+      cat /tmp/netplan-err.log >&2 || true
     fi
-
-    # Sanity check: MACs declarados existem no hardware
-    python3 - "$NETPLAN_DIR" "${PHYSICAL_NICS[@]}" <<'PYEOF'
-import os, sys, glob
-try:
-    from ruamel.yaml import YAML
-    loader = YAML(typ='safe').load
-except ImportError:
-    import yaml
-    loader = yaml.safe_load
-
-netplan_dir = sys.argv[1]
-physical_nics = sys.argv[2:]
-
-hw_macs = set()
-for nic in physical_nics:
-    try:
-        with open(f"/sys/class/net/{nic}/address") as f:
-            hw_macs.add(f.read().strip().lower())
-    except FileNotFoundError:
-        pass
-
-declared = set()
-for path in glob.glob(os.path.join(netplan_dir, "*.yaml")) + \
-            glob.glob(os.path.join(netplan_dir, "*.yml")):
-    try:
-        with open(path) as f:
-            data = loader(f)
-    except Exception:
-        continue
-    if not data:
-        continue
-    eth = (data.get('network') or {}).get('ethernets') or {}
-    for ifname, conf in eth.items():
-        if not isinstance(conf, dict):
-            continue
-        mac = (conf.get('match') or {}).get('macaddress')
-        if mac:
-            declared.add(mac.lower())
-
-missing = declared - hw_macs
-if missing:
-    print(f"❌ MACs no Netplan ausentes no hardware: {missing}", file=sys.stderr)
-    sys.exit(1)
-print(f"      OK: {len(declared)} MAC(s) declarado(s) batem com hardware")
-PYEOF
   fi
 
   # ---- Camada 2b: ifupdown (/etc/network/interfaces) ----
@@ -697,9 +567,9 @@ cat <<EOF
    Log do rollback:            /var/log/network-rollback.log
 
 🛡️  PROTEÇÕES ATIVAS:
-   • .link files congelando nomes de NIC via MAC
-   • Netplan com match: macaddress (se aplicável)
+   • .link files congelando nomes de NIC via MAC (camada principal)
    • /etc/network/interfaces com hwaddress (se aplicável)
+   • Netplan: NÃO modificado (validação apenas)
    • initramfs atualizado
    • Rollback automático 5min pós-boot se rede não subir
      - Só dispara se kernel atual for XanMod
