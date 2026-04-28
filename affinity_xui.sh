@@ -183,12 +183,6 @@ fi
 
 log_info "Range isolcpus: ${ISOLATED_RANGE}"
 
-# Aviso se o kernel atual ainda não tem essas flags (precisa reboot)
-if ! grep -q "isolcpus=" /proc/cmdline 2>/dev/null; then
-    log_warn "isolcpus= ainda NÃO está ativo no kernel atual — reboot é necessário"
-    log_warn "  CPUAffinity será aplicado, mas isolation só vale após reboot"
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Subtrair housekeeping (irqaffinity=) do range
 # ─────────────────────────────────────────────────────────────────────────────
