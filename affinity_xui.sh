@@ -1,9 +1,8 @@
 #!/bin/bash
 ###############################################################################
 #  XUI.One CPU Affinity Setter
-#  Lê isolcpus= do /proc/cmdline, exclui qualquer core de housekeeping
-#  (irqaffinity=) que possa estar inadvertidamente presente, e seta
-#  CPUAffinity= no /etc/systemd/system/xuione.service logo após [Service].
+#  Lê isolcpus= e irqaffinity= de /etc/default/grub, subtrai os cores de
+#  housekeeping do range isolado, e seta CPUAffinity= no service do XUI.One.
 ###############################################################################
 
 set -euo pipefail
@@ -20,6 +19,7 @@ log_ok()    { echo -e "${GREEN}[ OK ]${NC}  $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error() { echo -e "${RED}[ERRO]${NC}  $1"; }
 
+GRUB_FILE="/etc/default/grub"
 SERVICE_FILE="/etc/systemd/system/xuione.service"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ compact_range() {
     echo "$result"
 }
 
-# Remove cores de uma lista de outra: subtract "0-31" - "0,16" = "1-15,17-31"
+# subtract_range "0-31" "0,16" → "1-15,17-31"
 subtract_range() {
     local minuend="$1"
     local subtrahend="$2"
@@ -127,76 +127,86 @@ strip_isolcpus_flags() {
 # Verificações iniciais
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Verificar root
 if [[ $EUID -ne 0 ]]; then
     log_error "Este script precisa ser executado como root."
     exit 1
 fi
 
-# Validar service file
+if [[ ! -r "$GRUB_FILE" ]]; then
+    log_error "Arquivo GRUB não encontrado: ${GRUB_FILE}"
+    exit 1
+fi
+
 if [[ ! -f "$SERVICE_FILE" ]]; then
     log_error "Service file não encontrado: ${SERVICE_FILE}"
     exit 1
 fi
 
-# Validar que existe seção [Service]
 if ! grep -q '^\[Service\]' "$SERVICE_FILE"; then
     log_error "Service file não contém seção [Service]: ${SERVICE_FILE}"
     exit 1
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ler isolcpus= e irqaffinity= do /proc/cmdline
+# Ler isolcpus= e irqaffinity= de /etc/default/grub
 # ─────────────────────────────────────────────────────────────────────────────
-CMDLINE=$(cat /proc/cmdline)
+CMDLINE=""
+for var in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+    line=$(grep -E "^[[:space:]]*${var}=" "$GRUB_FILE" || true)
+    if [[ -n "$line" ]]; then
+        # Extrair conteúdo entre aspas (suporta " e ')
+        value=$(echo "$line" | sed -E "s/^[[:space:]]*${var}=//; s/^['\"]//; s/['\"][[:space:]]*$//")
+        CMDLINE="${CMDLINE} ${value}"
+    fi
+done
 
-ISOLCPUS_RAW=$(echo "$CMDLINE" | grep -oE 'isolcpus=[^ ]+' || echo "")
-IRQAFF_RAW=$(echo "$CMDLINE" | grep -oE 'irqaffinity=[^ ]+' || echo "")
-
-if [[ -z "$ISOLCPUS_RAW" ]]; then
-    log_error "isolcpus= não encontrado em /proc/cmdline"
-    log_info "Rode o tuner com isolation primeiro: sudo bash cpu_performance_tuner_v2.sh --nic <interface>"
+if [[ -z "$CMDLINE" ]]; then
+    log_error "GRUB_CMDLINE_LINUX_DEFAULT/GRUB_CMDLINE_LINUX não encontrados em ${GRUB_FILE}"
     exit 1
 fi
 
-# Limpar prefixos: isolcpus=managed_irq,domain,1-15,17-31 → 1-15,17-31
+ISOLCPUS_RAW=$(echo "$CMDLINE" | grep -oE 'isolcpus=[^ ]+' || true)
+IRQAFF_RAW=$(echo "$CMDLINE" | grep -oE 'irqaffinity=[^ ]+' || true)
+
+if [[ -z "$ISOLCPUS_RAW" ]]; then
+    log_error "isolcpus= não encontrado em ${GRUB_FILE}"
+    exit 1
+fi
+
+# Limpar prefixos: isolcpus=managed_irq,domain,2-15,34-47 → 2-15,34-47
 ISOLATED_RANGE=$(strip_isolcpus_flags "$ISOLCPUS_RAW")
 
-# Validar formato
 if [[ -z "$ISOLATED_RANGE" ]] || ! [[ "$ISOLATED_RANGE" =~ ^[0-9,-]+$ ]]; then
     log_error "Range isolcpus inválido após parse: '${ISOLATED_RANGE}'"
     exit 1
 fi
 
-log_info "Range isolcpus detectado: ${ISOLATED_RANGE}"
+log_info "Range isolcpus: ${ISOLATED_RANGE}"
+
+# Aviso se o kernel atual ainda não tem essas flags (precisa reboot)
+if ! grep -q "isolcpus=" /proc/cmdline 2>/dev/null; then
+    log_warn "isolcpus= ainda NÃO está ativo no kernel atual — reboot é necessário"
+    log_warn "  CPUAffinity será aplicado, mas isolation só vale após reboot"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filtrar cores de housekeeping (irqaffinity=)
+# Subtrair housekeeping (irqaffinity=) do range
 # ─────────────────────────────────────────────────────────────────────────────
 HK_RANGE=""
 if [[ -n "$IRQAFF_RAW" ]]; then
     HK_RANGE="${IRQAFF_RAW#irqaffinity=}"
     if [[ -n "$HK_RANGE" ]] && [[ "$HK_RANGE" =~ ^[0-9,-]+$ ]]; then
-        log_info "Range irqaffinity (housekeeping) detectado: ${HK_RANGE}"
+        log_info "Range housekeeping: ${HK_RANGE}"
 
-        # Subtrair housekeeping do range isolado (defesa contra inconsistência no GRUB)
         FILTERED_RANGE=$(subtract_range "$ISOLATED_RANGE" "$HK_RANGE")
 
         if [[ "$FILTERED_RANGE" != "$ISOLATED_RANGE" ]]; then
             log_warn "Cores housekeeping detectados em isolcpus — filtrando"
-            log_warn "  isolcpus original: ${ISOLATED_RANGE}"
-            log_warn "  housekeeping:      ${HK_RANGE}"
-            log_warn "  CPUAffinity final: ${FILTERED_RANGE}"
             ISOLATED_RANGE="$FILTERED_RANGE"
         fi
-    else
-        log_warn "irqaffinity= presente mas com formato inválido: '${HK_RANGE}' — ignorando filtro de housekeeping"
     fi
-else
-    log_info "Sem irqaffinity= no GRUB — usando isolcpus diretamente"
 fi
 
-# Validar que sobrou range não-vazio
 if [[ -z "$ISOLATED_RANGE" ]]; then
     log_error "Range vazio após filtrar housekeeping"
     exit 1
@@ -213,54 +223,45 @@ fi
 log_ok "CPUAffinity final: ${ISOLATED_RANGE}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Editar o service file:
-# 1. Remover qualquer linha CPUAffinity= existente
-# 2. Adicionar a nova logo após [Service]
-# Importante: criar o tmp NO MESMO diretório que SERVICE_FILE para garantir
-# que o mv final seja atômico (rename(2) em mesmo filesystem é atômico).
+# Editar o service file
+# ─────────────────────────────────────────────────────────────────────────────
 SERVICE_DIR=$(dirname "$SERVICE_FILE")
 TMP_FILE=$(mktemp -p "$SERVICE_DIR" .xuione.service.tmp.XXXXXX)
 trap 'rm -f "$TMP_FILE"' EXIT INT TERM HUP
 
 awk -v new_line="CPUAffinity=${ISOLATED_RANGE}" '
-    # Pular linhas CPUAffinity= existentes (remoção)
     /^[[:space:]]*CPUAffinity[[:space:]]*=/ { next }
-    # Imprimir todas as outras linhas
     { print }
-    # Logo após [Service], inserir a nova linha
     /^\[Service\][[:space:]]*$/ { print new_line }
 ' "$SERVICE_FILE" > "$TMP_FILE"
 
-# Validar que a linha nova está presente
 if ! grep -q "^CPUAffinity=${ISOLATED_RANGE}$" "$TMP_FILE"; then
     log_error "Falha ao inserir CPUAffinity no service file"
     exit 1
 fi
 
-# Idempotência: se conteúdo é idêntico ao atual, não fazer nada
+# Idempotência
 if cmp -s "$TMP_FILE" "$SERVICE_FILE"; then
-    log_ok "Service file já está correto (CPUAffinity=${ISOLATED_RANGE}) — nenhuma alteração necessária"
+    log_ok "Service file já está correto — nenhuma alteração necessária"
     exit 0
 fi
 
-# Aplicar a edição preservando permissões e dono originais via mv (atômico)
+# Aplicar (atômico via mv no mesmo filesystem)
 chown --reference="$SERVICE_FILE" "$TMP_FILE"
 chmod --reference="$SERVICE_FILE" "$TMP_FILE"
 mv "$TMP_FILE" "$SERVICE_FILE"
 log_ok "Service file atualizado: CPUAffinity=${ISOLATED_RANGE}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reload + restart condicional
+# Reload + restart
 # ─────────────────────────────────────────────────────────────────────────────
 systemctl daemon-reload
 log_ok "daemon-reload executado"
 
-# Só reinicia se serviço estava ativo (preserva manutenção planejada)
 if systemctl is-active --quiet xuione.service; then
     systemctl restart xuione.service
     log_ok "xuione.service reiniciado"
 
-    # Verificar status
     sleep 1
     if systemctl is-active --quiet xuione.service; then
         log_ok "xuione.service está rodando"
@@ -271,5 +272,5 @@ if systemctl is-active --quiet xuione.service; then
     fi
 else
     log_info "xuione.service não estava ativo — não reiniciado"
-    log_info "Para iniciar manualmente: sudo systemctl start xuione.service"
+    log_info "Para iniciar: sudo systemctl start xuione.service"
 fi
