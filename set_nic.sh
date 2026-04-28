@@ -3,7 +3,14 @@
 # nic_tune_all.sh - Tuning automatico de todas as NICs fisicas
 #
 # Configuracoes aplicadas em cada NIC fisica detectada:
-#   - Filas (channels): maximo suportado (combined preferencialmente, rx/tx em fallback)
+#   - Filas (channels combined): calculado como
+#         (threads do NUMA da NIC) - (count de housekeeping CPUs)
+#       Premissa: housekeeping sempre dentro do NUMA da NIC (script valida e
+#       avisa se nao for o caso).
+#       Housekeeping deduzido do /etc/default/grub:
+#         1. usa irqaffinity= se presente
+#         2. caso contrario, complemento de isolcpus/nohz_full
+#       Limitado ao maximo do hardware (ethtool -l).
 #   - Ring buffer RX/TX: maximo suportado
 #   - Coalescing: adaptive-rx on, adaptive-tx off, rx-usecs=16, tx-frames=32
 #
@@ -12,6 +19,10 @@
 #   sudo ./nic_tune_all.sh --dry-run    # mostra o que faria
 #   sudo ./nic_tune_all.sh --help       # ajuda
 #   sudo ./nic_tune_all.sh -i eth0      # aplica apenas na NIC indicada
+#   sudo ./nic_tune_all.sh -g /caminho  # caminho alternativo p/ grub config
+#
+# IMPORTANTE: housekeeping eh lido de /etc/default/grub (config p/ proximo boot).
+# Se alteraram o grub sem reboot, os valores nao refletem o kernel ativo.
 #
 
 set -uo pipefail
@@ -20,6 +31,7 @@ set -uo pipefail
 DRY_RUN=0
 TARGET_NIC=""
 INCLUDE_WIRELESS=0
+GRUB_FILE="/etc/default/grub"
 
 # ---------- parse args ----------
 usage() {
@@ -29,6 +41,7 @@ Uso: $0 [opcoes]
 Opcoes:
   --dry-run            Mostra o que seria feito, sem aplicar nada
   -i, --interface NIC  Aplica apenas na interface especificada
+  -g, --grub PATH      Caminho do arquivo de config do grub (default: /etc/default/grub)
   --include-wireless   Inclui interfaces wireless (padrao: ignora)
   -h, --help           Mostra esta ajuda
 
@@ -40,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)          DRY_RUN=1; shift ;;
         -i|--interface)     TARGET_NIC="${2:-}"; shift 2 ;;
+        -g|--grub)          GRUB_FILE="${2:-}"; shift 2 ;;
         --include-wireless) INCLUDE_WIRELESS=1; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Opcao desconhecida: $1"; usage; exit 1 ;;
@@ -130,9 +144,8 @@ is_physical() {
     [[ -e "${sys}/device" ]]          || return 1
 
     # Exclui interfaces filhas (vlan/macvlan tem 'lower_*')
-    local lower
-    lower=$(find "$sys" -maxdepth 1 -name 'lower_*' 2>/dev/null | head -n1)
-    [[ -n "$lower" ]] && return 1
+    local lower_glob=("${sys}"/lower_*)
+    [[ -e "${lower_glob[0]}" ]] && return 1
 
     # Exclui dummy
     if [[ -L "${sys}/device/driver" ]]; then
@@ -159,6 +172,228 @@ get_physical_nics() {
 
         printf '%s\n' "$name"
     done
+}
+
+# ============================================================
+# Helpers para cpulist, GRUB housekeeping e NUMA
+# ============================================================
+
+# Expande "0-3,7,10-12" -> "0 1 2 3 7 10 11 12" (separado por espaco)
+expand_cpulist() {
+    local list="$1"
+    [[ -z "$list" ]] && return 0
+
+    list="${list// /}"
+    local part start end i
+    local -a out=()
+    local IFS=','
+    read -ra parts <<< "$list"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        if [[ "$part" == *-* ]]; then
+            start="${part%-*}"
+            end="${part#*-}"
+            [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || continue
+            for ((i=start; i<=end; i++)); do out+=("$i"); done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            out+=("$part")
+        fi
+    done
+    printf '%s\n' "${out[@]}" | sort -un | tr '\n' ' '
+    echo
+}
+
+# Conta CPUs em uma cpulist
+count_cpulist() {
+    local list="$1"
+    [[ -z "$list" ]] && { echo 0; return; }
+    expand_cpulist "$list" | tr ' ' '\n' | grep -c '^[0-9]'
+}
+
+# Extrai o valor de uma chave (key=val) das linhas GRUB_CMDLINE_LINUX*
+# do arquivo $GRUB_FILE. Ignora linhas comentadas.
+# Para isolcpus=managed_irq,domain,2-15,34-47 retorna "2-15,34-47"
+# (remove flags conhecidas como managed_irq, domain, nohz, etc).
+grub_get_param() {
+    local key="$1"
+    local cmdline="" line raw
+
+    [[ -r "$GRUB_FILE" ]] || return 1
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ GRUB_CMDLINE_LINUX(_DEFAULT)?=\"([^\"]*)\" ]]; then
+            cmdline+=" ${BASH_REMATCH[2]}"
+        fi
+    done < "$GRUB_FILE"
+
+    # Procura "key=valor" (valor sem espaco)
+    if [[ "$cmdline" =~ (^|[[:space:]])${key}=([^[:space:]]+) ]]; then
+        raw="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+
+    # Para isolcpus, remove flags nao-numericas conhecidas
+    if [[ "$key" == "isolcpus" ]]; then
+        # Remove tokens nao-numericos (managed_irq, domain, nohz, etc)
+        local clean="" tok
+        local IFS=','
+        for tok in $raw; do
+            if [[ "$tok" =~ ^[0-9,-]+$ ]]; then
+                clean+="${clean:+,}${tok}"
+            fi
+        done
+        raw="$clean"
+    fi
+
+    echo "$raw"
+}
+
+# Determina o set de housekeeping CPUs lendo $GRUB_FILE.
+# Estrategia (em ordem):
+#   1. Se irqaffinity esta definido, usa-o (eh o mais explicito)
+#   2. Caso contrario, complemento de isolcpus (todos os CPUs - isolados)
+#   3. Caso contrario, complemento de nohz_full
+#   4. Vazio (nenhum housekeeping configurado)
+get_housekeeping_cpus() {
+    local hk
+
+    # 1. irqaffinity tem prioridade (mais explicito)
+    hk=$(grub_get_param "irqaffinity" 2>/dev/null || true)
+    if [[ -n "$hk" ]]; then
+        echo "$hk"
+        return 0
+    fi
+
+    # 2. Complemento de isolcpus ou nohz_full
+    local isolated
+    isolated=$(grub_get_param "isolcpus" 2>/dev/null || true)
+    [[ -z "$isolated" ]] && isolated=$(grub_get_param "nohz_full" 2>/dev/null || true)
+
+    if [[ -z "$isolated" ]]; then
+        return 0  # nenhum housekeeping configurado
+    fi
+
+    local total_cpus
+    total_cpus=$(nproc --all 2>/dev/null || echo 0)
+    if [[ "$total_cpus" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Calcula complemento usando array associativo (O(n) em vez de O(n*m))
+    local c
+    declare -A is_isolated
+    for c in $(expand_cpulist "$isolated"); do
+        is_isolated[$c]=1
+    done
+
+    local hk_list=""
+    for ((c=0; c<total_cpus; c++)); do
+        [[ -z "${is_isolated[$c]:-}" ]] && hk_list+="${c},"
+    done
+    echo "${hk_list%,}"
+}
+
+# Le NUMA node de uma NIC. Retorna -1 se nao tiver NUMA reportado
+# (single-socket, virtio sem afinidade, alguns ARMs).
+nic_numa_node() {
+    local nic="$1"
+    local f="/sys/class/net/${nic}/device/numa_node"
+    if [[ -r "$f" ]]; then
+        cat "$f"
+    else
+        echo "-1"
+    fi
+}
+
+# Le cpulist de um NUMA node. Se node = -1, retorna todos os CPUs.
+numa_cpulist() {
+    local node="$1"
+    if [[ "$node" == "-1" ]]; then
+        local total
+        total=$(nproc --all 2>/dev/null || echo 0)
+        [[ "$total" -gt 0 ]] && echo "0-$((total-1))" || echo ""
+        return
+    fi
+    local f="/sys/devices/system/node/node${node}/cpulist"
+    if [[ -r "$f" ]]; then
+        cat "$f"
+    else
+        echo ""
+    fi
+}
+
+# Calcula numero de queues para uma NIC.
+# Recebe: nic, max_combined (do hardware)
+# Imprime: numero de queues a aplicar (em stdout)
+#
+# Premissa: housekeeping CPUs do GRUB sempre estao dentro do NUMA da NIC.
+# Logo, basta subtrair o total de housekeeping do total de threads do NUMA.
+#
+# Logica:
+#   1. Sem housekeeping no grub  -> max_combined
+#   2. desejado = threads_do_NUMA - count(housekeeping)
+#   3. retorna min(desejado, max_combined), com piso 1
+#
+# Detalhes vao para stderr (log).
+calc_queues() {
+    local nic="$1"
+    local max_combined="$2"
+
+    local node numa_cpus hk threads_numa hk_count desired result
+
+    node=$(nic_numa_node "$nic")
+    numa_cpus=$(numa_cpulist "$node")
+    threads_numa=$(count_cpulist "$numa_cpus")
+    hk=$(get_housekeeping_cpus)
+    hk_count=$(count_cpulist "$hk")
+
+    {
+        printf '  NUMA da NIC: node=%s (CPUs: %s, threads=%d)\n' \
+            "$node" "${numa_cpus:-N/A}" "$threads_numa"
+        printf '  Housekeeping (grub): %s (count=%d)\n' "${hk:-(nenhum)}" "$hk_count"
+    } >&2
+
+    # Sem housekeeping -> usa maximo do hardware
+    if [[ "$hk_count" -eq 0 ]]; then
+        echo >&2 "  -> sem housekeeping: usando maximo do hardware ($max_combined)"
+        echo "$max_combined"
+        return
+    fi
+
+    desired=$((threads_numa - hk_count))
+    echo >&2 "  Calculo: $threads_numa threads - $hk_count hk = $desired"
+
+    # Sanity check: avisa se algum housekeeping CPU cair fora do NUMA da NIC
+    # (premissa do script eh que hk SEMPRE esta no NUMA da NIC, mas se o grub
+    # estiver mal configurado, o calculo acima fica incorreto)
+    if [[ -n "$numa_cpus" && "$node" != "-1" ]]; then
+        local hk_cpu numa_expanded out_of_numa=""
+        numa_expanded=" $(expand_cpulist "$numa_cpus")"
+        for hk_cpu in $(expand_cpulist "$hk"); do
+            if [[ "$numa_expanded" != *" $hk_cpu "* ]]; then
+                out_of_numa+="${hk_cpu},"
+            fi
+        done
+        if [[ -n "$out_of_numa" ]]; then
+            echo >&2 "  AVISO: housekeeping CPU(s) ${out_of_numa%,} estao FORA do NUMA $node da NIC"
+            echo >&2 "         O calculo pode estar incorreto - revise o GRUB"
+        fi
+    fi
+
+    # Limita ao maximo do hardware
+    if [[ "$desired" -gt "$max_combined" ]]; then
+        echo >&2 "  -> excede maximo do hardware ($max_combined): limitando"
+        result=$max_combined
+    elif [[ "$desired" -lt 1 ]]; then
+        echo >&2 "  -> calculo retornou <1: forcando 1"
+        result=1
+    else
+        result=$desired
+    fi
+
+    echo "$result"
 }
 
 # ---------- tuning de uma NIC ----------
@@ -195,7 +430,6 @@ tune_nic() {
         warn "$nic nao suporta configuracao de filas"
         status_channels="unsupported"
     else
-        # Isola APENAS as duas secoes (com awk, sem incluir linhas separadoras)
         local max_section preset_section
         max_section=$(echo "$ch_out"   | awk '/Pre-set maximums:/{f=1; next} /Current hardware settings:/{f=0} f')
         preset_section=$(echo "$ch_out" | awk '/Current hardware settings:/{f=1; next} f')
@@ -213,18 +447,23 @@ tune_nic() {
         log "  Atuais  -> Combined:${cur_combined:-N/A}  RX:${cur_rx:-N/A}  TX:${cur_tx:-N/A}"
         log "  Maximos -> Combined:${max_combined:-N/A}  RX:${max_rx:-N/A}  TX:${max_tx:-N/A}"
 
-        # Estrategia: tenta combined primeiro; se >0, usa combined.
-        # Caso contrario, usa rx/tx separados.
+        # Calcula queues baseado em NUMA da NIC e housekeeping CPUs do GRUB
+        local target_queues=""
         local applied=0
+
         if [[ -n "$max_combined" && "$max_combined" -gt 0 ]]; then
-            if [[ "$cur_combined" == "$max_combined" ]]; then
-                ok "Combined ja esta no maximo ($max_combined) - sem alteracao"
+            log "  Calculando queues a partir do GRUB e NUMA..."
+            target_queues=$(calc_queues "$nic" "$max_combined")
+            log "  -> Queues alvo: $target_queues (max hardware: $max_combined)"
+
+            if [[ "$cur_combined" == "$target_queues" ]]; then
+                ok "Combined ja esta em $target_queues - sem alteracao"
                 applied=1
                 status_channels="ok"
             else
-                log "  Aplicando combined=$max_combined"
-                if run ethtool -L "$nic" combined "$max_combined"; then
-                    ok "Filas combined ajustadas para $max_combined"
+                log "  Aplicando combined=$target_queues"
+                if run ethtool -L "$nic" combined "$target_queues"; then
+                    ok "Filas combined ajustadas para $target_queues"
                     applied=1
                     status_channels="ok"
                 else
@@ -233,15 +472,22 @@ tune_nic() {
             fi
         fi
 
+        # Fallback p/ NICs sem suporte a 'combined' (rx/tx separados)
         if [[ $applied -eq 0 && -n "$max_rx" && "$max_rx" -gt 0 \
               && -n "$max_tx" && "$max_tx" -gt 0 ]]; then
-            if [[ "$cur_rx" == "$max_rx" && "$cur_tx" == "$max_tx" ]]; then
-                ok "RX/TX ja estao no maximo (RX=$max_rx TX=$max_tx)"
+            log "  NIC nao suporta combined, calculando rx/tx separados..."
+            local target_rx target_tx
+            target_rx=$(calc_queues "$nic" "$max_rx")
+            target_tx=$(calc_queues "$nic" "$max_tx")
+            log "  -> RX alvo: $target_rx | TX alvo: $target_tx"
+
+            if [[ "$cur_rx" == "$target_rx" && "$cur_tx" == "$target_tx" ]]; then
+                ok "RX/TX ja estao em RX=$target_rx TX=$target_tx"
                 status_channels="ok"
             else
-                log "  Aplicando rx=$max_rx tx=$max_tx"
-                if run ethtool -L "$nic" rx "$max_rx" tx "$max_tx"; then
-                    ok "Filas RX=$max_rx TX=$max_tx aplicadas"
+                log "  Aplicando rx=$target_rx tx=$target_tx"
+                if run ethtool -L "$nic" rx "$target_rx" tx "$target_tx"; then
+                    ok "Filas RX=$target_rx TX=$target_tx aplicadas"
                     status_channels="ok"
                 else
                     warn "Falha em rx/tx: ${RUN_OUT:-(sem msg)}"
@@ -377,11 +623,33 @@ tune_nic() {
 echo
 echo "############################################################"
 echo "#  NIC Tuning - All Interfaces                             #"
-echo "#  Filas:MAX | Ring:MAX | Coalesce: arx=on atx=off         #"
-echo "#                        rx-usecs=16 tx-frames=32          #"
+echo "#  Filas: NUMA-aware | Ring: MAX                           #"
+echo "#  Coalesce: arx=on atx=off rx-usecs=16 tx-frames=32       #"
 echo "############################################################"
 
 [[ $DRY_RUN -eq 1 ]] && warn "MODO DRY-RUN: nenhuma alteracao sera aplicada"
+
+# Mostra housekeeping detectado (so para info)
+log "Lendo housekeeping CPUs de: $GRUB_FILE"
+if [[ ! -r "$GRUB_FILE" ]]; then
+    warn "Arquivo $GRUB_FILE nao legivel - assumindo sem housekeeping (queues = max)"
+else
+    hk_detected=$(get_housekeeping_cpus)
+    hk_method=""
+    if [[ -n "$(grub_get_param irqaffinity 2>/dev/null)" ]]; then
+        hk_method="irqaffinity"
+    elif [[ -n "$(grub_get_param isolcpus 2>/dev/null)" ]]; then
+        hk_method="complemento de isolcpus"
+    elif [[ -n "$(grub_get_param nohz_full 2>/dev/null)" ]]; then
+        hk_method="complemento de nohz_full"
+    fi
+    if [[ -n "$hk_detected" ]]; then
+        log "Housekeeping CPUs: $hk_detected (via ${hk_method:-desconhecido})"
+    else
+        warn "Nenhum housekeeping detectado no grub - queues serao = max do hardware"
+    fi
+    unset hk_detected hk_method
+fi
 
 # Determina lista de NICs
 NICS=()
