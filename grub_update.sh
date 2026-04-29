@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-#  CPU Performance Tuner v2.1
+#  CPU Performance Tuner v2.3
 #  Auto-detect CPU + Configurar GRUB + cpufrequtils + Ulimits
 #  Foco: Streaming / Máximo throughput / Mínima latência de tráfego
 #  Compatível com: Intel Xeon, AMD Ryzen, AMD EPYC
@@ -152,7 +152,7 @@ fi
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   CPU Performance Tuner v2.1 - Maximum Streaming Throughput ║${NC}"
+echo -e "${BOLD}║   CPU Performance Tuner v2.3 - Maximum Streaming Throughput ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -505,6 +505,7 @@ log_section "3/8 - MONTAGEM DA LINHA GRUB"
 
 CPU_TYPE="unknown"
 PSTATE_DRIVER=""
+INTEL_IDLE_FLAG=""
 IOMMU_FLAGS=""
 EXTRA_NOTES=()
 
@@ -512,19 +513,63 @@ EXTRA_NOTES=()
 # BLOCO 1: Parâmetros comuns — aplicados em Intel E AMD
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#   mitigations=off                       → Desabilita TODAS as mitigações de CPU (Spectre, Meltdown, MDS, etc.) — MÁXIMO desempenho
-#   nowatchdog                            → Desabilita watchdog do kernel (remove interrupções NMI periódicas)
-#   nmi_watchdog=0                        → Desabilita NMI watchdog especificamente (complementa nowatchdog)
-#   audit=0                               → Desabilita subsistema de auditoria (remove overhead de syscall logging)
-#   cpufreq.default_governor=performance  → Define governor performance no boot do kernel (kernel 5.9+), antes de qualquer userspace
-#   random.trust_cpu=on                   → Usa RDRAND/RDSEED como fonte de entropia (boot rápido + SSL handshakes rápidos)
+# ── Performance / segurança vs. velocidade ──
+#   mitigations=off                       → Desabilita TODAS as mitigações de CPU (Spectre, Meltdown, MDS,
+#                                           L1TF, Retbleed, Downfall, etc.) — MÁXIMO desempenho.
+#                                           Ganho típico: 8-15% PPS em workloads com muito syscall.
+#                                           Risco: servidor multi-tenant com código não confiável.
+#
+# ── Clocksource ──
+#   tsc=reliable                          → Marca TSC como confiável (desliga watchdog que pode marcar TSC
+#                                           como instável e fazer fallback para HPET — regressão até 90% em rede).
+#   clocksource=tsc                       → Força TSC como clocksource (menor overhead em gettimeofday/clock_gettime).
+#   hpet=disable                          → Desabilita HPET (evita interrupções do timer legado, libera IRQ).
+#
+# ── Watchdogs / detection ──
+#   nowatchdog                            → Desabilita watchdog do kernel (remove NMIs periódicos em todos os cores).
+#   nmi_watchdog=0                        → Desabilita NMI watchdog especificamente (complementa nowatchdog).
+#   nosoftlockup                          → Desabilita softlockup detection (kthread watchdog/N).
+#   skew_tick=1                           → Desalinha timer ticks entre cores (reduz contenção de cache lines
+#                                           e locks de scheduler/timer em sistemas com 32+ threads).
+#
+# ── Subsistemas dispensáveis ──
+#   audit=0                               → Desabilita subsistema de auditoria (remove overhead de syscall logging).
+#   noresume                              → Desabilita resume de hibernação (boot rápido, sem busca de imagem).
+#   selinux=0                             → Desabilita SELinux (RHEL/CentOS). Inócuo em Ubuntu/Debian.
+#   apparmor=0                            → Desabilita AppArmor (Ubuntu/Debian). Inócuo em RHEL/CentOS.
+#
+# ── Workqueue / PCIe ──
+#   workqueue.power_efficient=0           → Force workqueues per-CPU (cache locality), em vez de unbound (power saving).
+#                                           Importante para netfilter, conntrack, e workqueues de rede em geral.
+#   pcie_aspm=off                         → Desabilita PCIe Active State Power Management (latência zero em
+#                                           NICs 25G+/100G — wake-up de L1 mata throughput consistente).
+#
+# ── Frequência / C-states ──
+#   cpufreq.default_governor=performance  → Define governor performance no boot do kernel (kernel 5.9+).
+#   processor.max_cstate=1                → Driver acpi_idle: permite só C0+C1. Bloqueia C2/C3/C6/C7 (latência 100μs+).
+#                                           Em Intel com intel_idle ativo, este flag é ignorado — por isso
+#                                           adicionamos intel_idle.max_cstate=1 no bloco Intel.
+#
+# ── Misc ──
+#   random.trust_cpu=on                   → Usa RDRAND/RDSEED como fonte de entropia (boot rápido + SSL handshakes).
 #
 COMMON_FLAGS=""
 COMMON_FLAGS+=" mitigations=off"
+COMMON_FLAGS+=" tsc=reliable"
+COMMON_FLAGS+=" clocksource=tsc"
+COMMON_FLAGS+=" hpet=disable"
 COMMON_FLAGS+=" nowatchdog"
 COMMON_FLAGS+=" nmi_watchdog=0"
+COMMON_FLAGS+=" nosoftlockup"
+COMMON_FLAGS+=" skew_tick=1"
 COMMON_FLAGS+=" audit=0"
+COMMON_FLAGS+=" noresume"
+COMMON_FLAGS+=" selinux=0"
+COMMON_FLAGS+=" apparmor=0"
+COMMON_FLAGS+=" workqueue.power_efficient=0"
+COMMON_FLAGS+=" pcie_aspm=off"
 COMMON_FLAGS+=" cpufreq.default_governor=performance"
+COMMON_FLAGS+=" processor.max_cstate=1"
 COMMON_FLAGS+=" random.trust_cpu=on"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -548,10 +593,14 @@ PERF_BOOT_FLAGS+=" transparent_hugepage=madvise"
 if [[ "$VENDOR" == "GenuineIntel" ]]; then
     # ── INTEL ──────────────────────────────────────────────────────────────
     #   intel_pstate=active          → Driver Intel P-state em modo active (HWP direto)
+    #   intel_idle.max_cstate=1      → Limita o driver intel_idle a C0+C1 (defesa em profundidade
+    #                                  sobre processor.max_cstate=1, que é ignorado quando intel_idle
+    #                                  está ativo). Wake-up via MWAIT ~1μs.
     #   intel_iommu=on               → Ativa Intel VT-d IOMMU
     #   iommu=pt                     → IOMMU em passthrough (zero overhead de tradução para DMA)
     #
     PSTATE_DRIVER="intel_pstate=active"
+    INTEL_IDLE_FLAG="intel_idle.max_cstate=1"
     IOMMU_FLAGS="intel_iommu=on iommu=pt"
 
     if echo "$MODEL_NAME" | grep -qiE "xeon.*(gold|platinum|silver|bronze)"; then
@@ -880,6 +929,7 @@ fi
 GRUB_LINE="${PSTATE_DRIVER}"
 GRUB_LINE+="${COMMON_FLAGS}"
 GRUB_LINE+="${PERF_BOOT_FLAGS}"
+[[ -n "${INTEL_IDLE_FLAG}" ]] && GRUB_LINE+=" ${INTEL_IDLE_FLAG}"
 [[ -n "$ISOLATION_FLAGS" ]]  && GRUB_LINE+="${ISOLATION_FLAGS}"
 GRUB_LINE+=" ${IOMMU_FLAGS}"
 
@@ -1220,7 +1270,7 @@ log_ok "Boot script: ${TUNING_SCRIPT}"
 
 cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
-Description=CPU Performance Tuner for Streaming (v2.1)
+Description=CPU Performance Tuner for Streaming (v2.3)
 After=multi-user.target
 
 [Service]
