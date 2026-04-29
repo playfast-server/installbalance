@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # install_xanmod.sh - Prepara o sistema e instala o kernel XanMod v3
 #
-# Estratégia de segurança:
-#   - Instala XanMod ANTES de remover kernels antigos (kernel anterior fica
-#     disponível como fallback no menu do GRUB)
+# ATENÇÃO: Este script remove TODOS os kernels existentes antes de instalar
+# o XanMod. Se a instalação do XanMod falhar, o servidor ficará sem kernel
+# bootável. NÃO REINICIE em caso de falha.
 #
 # Compatível com Ubuntu/Debian.
 
@@ -139,13 +139,33 @@ printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.
   > /etc/apt/sources.list.d/xanmod-release.list
 
 ########################################
-# 7) Instalar kernel XanMod v3
+# 7) Remover TODOS os kernels antes da instalação do XanMod
+########################################
+echo "==> Removendo todos os kernels instalados..."
+
+mapfile -t ALL_KERNELS < <(
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \
+    | awk '/^ii/ {print $2}' \
+    | grep -vE '^(linux-image|linux-headers)$' || true
+)
+
+if [ "${#ALL_KERNELS[@]}" -gt 0 ]; then
+  echo "   Removendo: ${ALL_KERNELS[*]}"
+  if ! apt-get remove --purge "${APT_OPTS[@]}" "${ALL_KERNELS[@]}"; then
+    echo "❌ Falha ao remover kernels existentes. Abortando." >&2
+    exit 1
+  fi
+else
+  echo "   Nenhum kernel encontrado para remover."
+fi
+
+########################################
+# 8) Instalar kernel XanMod v3
 ########################################
 echo "==> Verificando espaço em /boot..."
 BOOT_FREE_MB=$(df -BM --output=avail /boot 2>/dev/null | awk 'NR==2 {gsub("M",""); print $1}')
 if [ -n "${BOOT_FREE_MB:-}" ] && [ "$BOOT_FREE_MB" -lt 250 ]; then
   echo "❌ Espaço em /boot insuficiente: ${BOOT_FREE_MB}MB livres (mínimo 250MB)." >&2
-  echo "   Remova kernels antigos manualmente antes de continuar." >&2
   exit 1
 fi
 echo "   /boot tem ${BOOT_FREE_MB:-?}MB livres."
@@ -153,47 +173,27 @@ echo "   /boot tem ${BOOT_FREE_MB:-?}MB livres."
 echo "==> Instalando kernel XanMod v3..."
 apt-get update
 if ! apt-get install "${APT_OPTS[@]}" linux-xanmod-x64v3; then
-  echo "❌ Falha ao instalar XanMod. Kernels antigos NÃO foram removidos." >&2
+  echo "❌ Falha ao instalar XanMod. ATENÇÃO: nenhum kernel está instalado!" >&2
+  echo "   NÃO REINICIE o servidor. Investigue e instale um kernel manualmente." >&2
   exit 1
 fi
 
 ########################################
-# 8) Validar instalação do XanMod ANTES de prosseguir
+# 9) Validar instalação do XanMod
 ########################################
 echo "==> Validando instalação do XanMod..."
 XANMOD_PKGS="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*xanmod*' 2>/dev/null | awk '/^ii/ {print $2}')"
 if [ -z "$XANMOD_PKGS" ]; then
-  echo "❌ Nenhum pacote linux-image-*xanmod* instalado. Abortando." >&2
+  echo "❌ Nenhum pacote linux-image-*xanmod* instalado." >&2
+  echo "   ATENÇÃO: nenhum kernel pode estar disponível. NÃO REINICIE." >&2
   exit 1
 fi
 echo "   XanMod instalado: $XANMOD_PKGS"
 
 if ! compgen -G "/boot/vmlinuz-*xanmod*" >/dev/null; then
-  echo "❌ Imagem XanMod não encontrada em /boot. Abortando." >&2
+  echo "❌ Imagem XanMod não encontrada em /boot." >&2
+  echo "   ATENÇÃO: NÃO REINICIE o servidor." >&2
   exit 1
-fi
-
-########################################
-# 9) Remover kernels antigos (preservando XanMod e o em execução)
-########################################
-echo "==> Procurando kernels antigos para remover..."
-
-mapfile -t OLD_KERNELS < <(
-  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \
-    | awk '/^ii/ {print $2}' \
-    | grep -v -- '-xanmod' \
-    | grep -v "${RUNNING_KERNEL}$" \
-    | grep -vE '^(linux-image|linux-headers)$' || true
-)
-
-if [ "${#OLD_KERNELS[@]}" -gt 0 ]; then
-  echo "   Removendo: ${OLD_KERNELS[*]}"
-  if ! apt-get remove --purge "${APT_OPTS[@]}" "${OLD_KERNELS[@]}"; then
-    echo "   ⚠️  Falha ao remover alguns kernels antigos. Verifique manualmente." >&2
-    echo "       (instalação do XanMod permanece intacta)" >&2
-  fi
-else
-  echo "   Nenhum kernel antigo encontrado para remover."
 fi
 
 ########################################
@@ -202,37 +202,6 @@ fi
 echo "==> Limpeza final..."
 apt-get autoremove --purge "${APT_OPTS[@]}"
 apt-get autoclean "${APT_OPTS[@]}"
-
-########################################
-# 11) Atualizar GRUB e configurar XanMod como default
-########################################
-echo "==> Configurando GRUB_DEFAULT=0..."
-
-# Backup do /etc/default/grub antes de modificar
-cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%Y%m%d-%H%M%S)"
-
-# Atualiza APENAS a linha GRUB_DEFAULT (preserva GRUB_CMDLINE_LINUX_DEFAULT e outras)
-if grep -qE '^GRUB_DEFAULT=' /etc/default/grub; then
-  sed -ri 's|^GRUB_DEFAULT=.*$|GRUB_DEFAULT=0|' /etc/default/grub
-else
-  echo 'GRUB_DEFAULT=0' >> /etc/default/grub
-fi
-
-echo "   Confirmação:"
-grep '^GRUB_DEFAULT' /etc/default/grub | sed 's/^/      /'
-
-echo "==> Atualizando GRUB..."
-if command -v update-grub >/dev/null 2>&1; then
-  if ! update-grub; then
-    echo "   ⚠️  update-grub retornou erro." >&2
-  fi
-elif command -v grub-mkconfig >/dev/null 2>&1; then
-  if ! grub-mkconfig -o /boot/grub/grub.cfg; then
-    echo "   ⚠️  grub-mkconfig retornou erro." >&2
-  fi
-else
-  echo "   ⚠️  Nem update-grub nem grub-mkconfig encontrados. Sistema pode usar outro bootloader." >&2
-fi
 
 ########################################
 # Conclusão
@@ -246,9 +215,6 @@ cat <<EOF
    Kernel atual (em execução): $RUNNING_KERNEL
    Kernel XanMod instalado:    ${INSTALLED_XANMOD:-não detectado}
    Log da instalação:          $LOG
-
-⚠️  Configuração do GRUB:
-   • GRUB_DEFAULT=0 (boota a primeira entrada do menu)
 
 ⚠️  Após o reboot:
    1. Valide com:  uname -r && ip -br link && ip route
