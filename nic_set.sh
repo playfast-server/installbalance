@@ -12,7 +12,6 @@
 #         2. caso contrario, complemento de isolcpus/nohz_full
 #       Limitado ao maximo do hardware (ethtool -l).
 #   - Ring buffer RX/TX: maximo suportado
-#   - Coalescing: adaptive-rx on, adaptive-tx off, rx-usecs=16, tx-frames=32
 #
 # Uso:
 #   sudo ./nic_tune_all.sh              # aplica em todas
@@ -23,6 +22,12 @@
 #
 # IMPORTANTE: housekeeping eh lido de /etc/default/grub (config p/ proximo boot).
 # Se alteraram o grub sem reboot, os valores nao refletem o kernel ativo.
+#
+# NICs ignoradas automaticamente:
+#   - loopback, bridges, bonds (a propria interface)
+#   - SLAVES de bond/bridge/team (modificar suas filas pode quebrar o agregado)
+#   - tun/tap, dummy, vlan/macvlan (interfaces filhas)
+#   - wireless (a menos que --include-wireless)
 #
 
 set -uo pipefail
@@ -46,14 +51,25 @@ Opcoes:
   -h, --help           Mostra esta ajuda
 
 Sem argumentos, aplica em todas as NICs fisicas cabeadas detectadas.
+Slaves de bond/bridge sao ignorados automaticamente para nao quebrar o agregado.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)          DRY_RUN=1; shift ;;
-        -i|--interface)     TARGET_NIC="${2:-}"; shift 2 ;;
-        -g|--grub)          GRUB_FILE="${2:-}"; shift 2 ;;
+        -i|--interface)
+            if [[ -z "${2:-}" ]]; then
+                echo "Erro: -i/--interface exige nome de interface" >&2
+                exit 1
+            fi
+            TARGET_NIC="$2"; shift 2 ;;
+        -g|--grub)
+            if [[ -z "${2:-}" ]]; then
+                echo "Erro: -g/--grub exige caminho do arquivo" >&2
+                exit 1
+            fi
+            GRUB_FILE="$2"; shift 2 ;;
         --include-wireless) INCLUDE_WIRELESS=1; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Opcao desconhecida: $1"; usage; exit 1 ;;
@@ -78,7 +94,7 @@ err()   { printf "%s[ERRO]%s  %s\n"  "$RED"    "$NC" "$*" >&2; }
 
 # ---------- contadores p/ resumo ----------
 TOTAL_NICS=0
-declare -A NIC_RESULT  # ok | partial | fail | unsupported
+declare -A NIC_RESULT  # ok | fail | unsupported
 
 # ---------- pre-checks ----------
 if [[ $EUID -ne 0 && $DRY_RUN -eq 0 ]]; then
@@ -107,6 +123,7 @@ run() {
 
 # Extrai valor numerico de uma chave dentro de um BLOCO de texto delimitado.
 # Retorna string vazia se nao encontrar ou se valor for "n/a".
+# Nota: keys usados (RX, TX, Combined) sao seguros para regex.
 extract_value() {
     local input="$1"
     local key="$2"
@@ -128,6 +145,27 @@ is_wireless() {
     local nic="$1"
     [[ -d "/sys/class/net/${nic}/wireless" ]] || \
     [[ -L "/sys/class/net/${nic}/phy80211" ]]
+}
+
+# Detecta se interface eh slave de bond/bridge/team.
+# Modificar filas em slaves pode quebrar o agregado.
+is_slave() {
+    local nic="$1"
+    local sys="/sys/class/net/${nic}"
+
+    # Slave de bridge tem /sys/class/net/<iface>/brport/
+    [[ -d "${sys}/brport" ]] && return 0
+
+    # Slave de bond/team tem 'master' como symlink p/ a interface mestre
+    if [[ -L "${sys}/master" ]]; then
+        return 0
+    fi
+
+    # Tem upper_* (slave em kernels modernos)
+    local upper_glob=("${sys}"/upper_*)
+    [[ -e "${upper_glob[0]}" ]] && return 0
+
+    return 1
 }
 
 # Detecta se interface eh fisica/real (NIC ou virtio)
@@ -157,7 +195,9 @@ is_physical() {
     return 0
 }
 
-# Detecta NICs fisicas (uma por linha, seguro p/ mapfile)
+# Detecta NICs fisicas (uma por linha, seguro p/ mapfile).
+# Em auto-detect, exclui slaves de bond/bridge para evitar quebrar o agregado.
+# Quando -i eh usado, slaves passam a ser permitidos (usuario assume o risco).
 get_physical_nics() {
     local nic name
     for nic in /sys/class/net/*; do
@@ -170,6 +210,11 @@ get_physical_nics() {
             continue
         fi
 
+        # Em auto-detect, pula slaves silenciosamente
+        if is_slave "$name"; then
+            continue
+        fi
+
         printf '%s\n' "$name"
     done
 }
@@ -179,6 +224,7 @@ get_physical_nics() {
 # ============================================================
 
 # Expande "0-3,7,10-12" -> "0 1 2 3 7 10 11 12" (separado por espaco)
+# Retorna string vazia (sem espacos espurios) se input nao tiver numeros.
 expand_cpulist() {
     local list="$1"
     [[ -z "$list" ]] && return 0
@@ -199,21 +245,29 @@ expand_cpulist() {
             out+=("$part")
         fi
     done
+    # Se nada foi acumulado, retorna vazio (evita produzir " \n")
+    [[ ${#out[@]} -eq 0 ]] && return 0
     printf '%s\n' "${out[@]}" | sort -un | tr '\n' ' '
     echo
 }
 
-# Conta CPUs em uma cpulist
+# Conta CPUs em uma cpulist. Lida com retorno vazio ou apenas-espacos.
 count_cpulist() {
     local list="$1"
     [[ -z "$list" ]] && { echo 0; return; }
-    expand_cpulist "$list" | tr ' ' '\n' | grep -c '^[0-9]'
+    local expanded
+    expanded=$(expand_cpulist "$list")
+    # Remove espacos para checar se ficou alguma coisa
+    if [[ -z "${expanded// /}" ]]; then
+        echo 0
+        return
+    fi
+    echo "$expanded" | tr ' ' '\n' | grep -c '^[0-9]'
 }
 
 # Extrai o valor de uma chave (key=val) das linhas GRUB_CMDLINE_LINUX*
-# do arquivo $GRUB_FILE. Ignora linhas comentadas.
-# Para isolcpus=managed_irq,domain,2-15,34-47 retorna "2-15,34-47"
-# (remove flags conhecidas como managed_irq, domain, nohz, etc).
+# do arquivo $GRUB_FILE. Aceita aspas duplas E simples. Ignora comentarios.
+# Para isolcpus=managed_irq,domain,2-15,34-47 retorna "2-15,34-47".
 grub_get_param() {
     local key="$1"
     local cmdline="" line raw
@@ -222,7 +276,11 @@ grub_get_param() {
 
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # Aspas duplas
         if [[ "$line" =~ GRUB_CMDLINE_LINUX(_DEFAULT)?=\"([^\"]*)\" ]]; then
+            cmdline+=" ${BASH_REMATCH[2]}"
+        # Aspas simples
+        elif [[ "$line" =~ GRUB_CMDLINE_LINUX(_DEFAULT)?=\'([^\']*)\' ]]; then
             cmdline+=" ${BASH_REMATCH[2]}"
         fi
     done < "$GRUB_FILE"
@@ -236,7 +294,6 @@ grub_get_param() {
 
     # Para isolcpus, remove flags nao-numericas conhecidas
     if [[ "$key" == "isolcpus" ]]; then
-        # Remove tokens nao-numericos (managed_irq, domain, nohz, etc)
         local clean="" tok
         local IFS=','
         for tok in $raw; do
@@ -247,19 +304,22 @@ grub_get_param() {
         raw="$clean"
     fi
 
+    # Se apos limpeza ficou vazio, considera "nao encontrado"
+    [[ -z "$raw" ]] && return 1
+
     echo "$raw"
 }
 
 # Determina o set de housekeeping CPUs lendo $GRUB_FILE.
-# Estrategia (em ordem):
-#   1. Se irqaffinity esta definido, usa-o (eh o mais explicito)
-#   2. Caso contrario, complemento de isolcpus (todos os CPUs - isolados)
+# Estrategia:
+#   1. Se irqaffinity esta definido, usa-o (mais explicito)
+#   2. Caso contrario, complemento de isolcpus
 #   3. Caso contrario, complemento de nohz_full
 #   4. Vazio (nenhum housekeeping configurado)
 get_housekeeping_cpus() {
     local hk
 
-    # 1. irqaffinity tem prioridade (mais explicito)
+    # 1. irqaffinity tem prioridade
     hk=$(grub_get_param "irqaffinity" 2>/dev/null || true)
     if [[ -n "$hk" ]]; then
         echo "$hk"
@@ -300,8 +360,14 @@ get_housekeeping_cpus() {
 nic_numa_node() {
     local nic="$1"
     local f="/sys/class/net/${nic}/device/numa_node"
+    local val
     if [[ -r "$f" ]]; then
-        cat "$f"
+        val=$(cat "$f" 2>/dev/null)
+        if [[ "$val" =~ ^-?[0-9]+$ ]]; then
+            echo "$val"
+        else
+            echo "-1"
+        fi
     else
         echo "-1"
     fi
@@ -366,8 +432,6 @@ calc_queues() {
     echo >&2 "  Calculo: $threads_numa threads - $hk_count hk = $desired"
 
     # Sanity check: avisa se algum housekeeping CPU cair fora do NUMA da NIC
-    # (premissa do script eh que hk SEMPRE esta no NUMA da NIC, mas se o grub
-    # estiver mal configurado, o calculo acima fica incorreto)
     if [[ -n "$numa_cpus" && "$node" != "-1" ]]; then
         local hk_cpu numa_expanded out_of_numa=""
         numa_expanded=" $(expand_cpulist "$numa_cpus")"
@@ -399,12 +463,19 @@ calc_queues() {
 # ---------- tuning de uma NIC ----------
 tune_nic() {
     local nic="$1"
-    local status_channels="skip" status_ring="skip" status_coal="skip"
+    local status_channels="skip" status_ring="skip"
 
     echo
     echo "============================================================"
     log "Configurando NIC: ${YELLOW}${nic}${NC}"
     echo "============================================================"
+
+    # Aviso se eh slave (so chega aqui se foi forcado via -i)
+    if is_slave "$nic"; then
+        warn "Interface eh SLAVE de bond/bridge/team!"
+        warn "Modificar filas em slaves pode degradar ou quebrar o agregado."
+        warn "Prosseguindo porque foi explicitamente solicitada via -i"
+    fi
 
     # Estado e driver
     local state driver
@@ -421,7 +492,7 @@ tune_nic() {
     fi
 
     # ---------- 1. FILAS (CHANNELS) ----------
-    log "[1/3] Lendo capacidade de filas (channels)..."
+    log "[1/2] Lendo capacidade de filas (channels)..."
     local ch_out ch_rc
     ch_out=$(ethtool -l "$nic" 2>&1)
     ch_rc=$?
@@ -450,6 +521,7 @@ tune_nic() {
         # Calcula queues baseado em NUMA da NIC e housekeeping CPUs do GRUB
         local target_queues=""
         local applied=0
+        local combined_failed=0
 
         if [[ -n "$max_combined" && "$max_combined" -gt 0 ]]; then
             log "  Calculando queues a partir do GRUB e NUMA..."
@@ -468,6 +540,7 @@ tune_nic() {
                     status_channels="ok"
                 else
                     warn "Falha em combined: ${RUN_OUT:-(sem msg)}"
+                    combined_failed=1
                 fi
             fi
         fi
@@ -475,7 +548,7 @@ tune_nic() {
         # Fallback p/ NICs sem suporte a 'combined' (rx/tx separados)
         if [[ $applied -eq 0 && -n "$max_rx" && "$max_rx" -gt 0 \
               && -n "$max_tx" && "$max_tx" -gt 0 ]]; then
-            log "  NIC nao suporta combined, calculando rx/tx separados..."
+            log "  NIC nao suporta combined ou combined falhou; tentando rx/tx separados..."
             local target_rx target_tx
             target_rx=$(calc_queues "$nic" "$max_rx")
             target_tx=$(calc_queues "$nic" "$max_tx")
@@ -495,13 +568,19 @@ tune_nic() {
                 fi
             fi
         elif [[ $applied -eq 0 ]]; then
-            warn "Sem valores validos de filas para aplicar"
-            status_channels="unsupported"
+            # Nao aplicou combined nem ha rx/tx fallback
+            if [[ $combined_failed -eq 1 ]]; then
+                # Combined foi tentado e falhou - eh fail real
+                status_channels="fail"
+            else
+                warn "Sem valores validos de filas para aplicar"
+                status_channels="unsupported"
+            fi
         fi
     fi
 
     # ---------- 2. RING BUFFER ----------
-    log "[2/3] Lendo capacidade de ring buffer..."
+    log "[2/2] Lendo capacidade de ring buffer..."
     local rg_out rg_rc
     rg_out=$(ethtool -g "$nic" 2>&1)
     rg_rc=$?
@@ -544,79 +623,18 @@ tune_nic() {
         fi
     fi
 
-    # ---------- 3. COALESCING ----------
-    log "[3/3] Configurando interrupt coalescing..."
-    local co_out co_rc
-    co_out=$(ethtool -c "$nic" 2>&1)
-    co_rc=$?
-
-    if [[ $co_rc -ne 0 ]] || echo "$co_out" | grep -qiE "Operation not supported|Coalesce parameters not supported"; then
-        warn "$nic nao suporta interrupt coalescing"
-        status_coal="unsupported"
-    else
-        log "  Aplicando: adaptive-rx on, adaptive-tx off, rx-usecs=16, tx-frames=32"
-
-        # Tenta tudo de uma vez primeiro (caminho feliz)
-        if run ethtool -C "$nic" adaptive-rx on adaptive-tx off rx-usecs 16 tx-frames 32; then
-            ok "Coalescing aplicado integralmente"
-            status_coal="ok"
-        else
-            warn "Falha em batch: ${RUN_OUT:-(sem msg)}"
-            warn "Tentando parametros individualmente..."
-
-            local fails=0 successes=0
-
-            # Tenta os adaptives juntos (alguns drivers exigem)
-            if run ethtool -C "$nic" adaptive-rx on adaptive-tx off; then
-                ok "  adaptive-rx on, adaptive-tx off"
-                successes=$((successes+1))
-            else
-                if run ethtool -C "$nic" adaptive-rx on; then
-                    ok "  adaptive-rx on"; successes=$((successes+1))
-                else
-                    warn "  adaptive-rx on falhou: ${RUN_OUT}"; fails=$((fails+1))
-                fi
-                if run ethtool -C "$nic" adaptive-tx off; then
-                    ok "  adaptive-tx off"; successes=$((successes+1))
-                else
-                    warn "  adaptive-tx off falhou: ${RUN_OUT}"; fails=$((fails+1))
-                fi
-            fi
-
-            if run ethtool -C "$nic" rx-usecs 16; then
-                ok "  rx-usecs=16"; successes=$((successes+1))
-            else
-                warn "  rx-usecs 16 falhou: ${RUN_OUT}"; fails=$((fails+1))
-            fi
-
-            if run ethtool -C "$nic" tx-frames 32; then
-                ok "  tx-frames=32"; successes=$((successes+1))
-            else
-                warn "  tx-frames 32 falhou: ${RUN_OUT}"; fails=$((fails+1))
-            fi
-
-            if [[ $fails -eq 0 ]]; then
-                status_coal="ok"
-            elif [[ $successes -gt 0 ]]; then
-                status_coal="partial"
-            else
-                status_coal="fail"
-            fi
-        fi
-    fi
-
     # ---------- resultado da NIC ----------
-    if [[ "$status_channels" == "fail" || "$status_ring" == "fail" || "$status_coal" == "fail" ]]; then
+    # Logica: qualquer fail -> fail. Se TUDO unsupported -> unsupported.
+    # Caso contrario (algum ok, ou um ok + um unsupported) -> ok.
+    if [[ "$status_channels" == "fail" || "$status_ring" == "fail" ]]; then
         NIC_RESULT[$nic]="fail"
-    elif [[ "$status_coal" == "partial" ]]; then
-        NIC_RESULT[$nic]="partial"
-    elif [[ "$status_channels" == "ok" || "$status_ring" == "ok" || "$status_coal" == "ok" ]]; then
-        NIC_RESULT[$nic]="ok"
-    else
+    elif [[ "$status_channels" == "unsupported" && "$status_ring" == "unsupported" ]]; then
         NIC_RESULT[$nic]="unsupported"
+    else
+        NIC_RESULT[$nic]="ok"
     fi
 
-    log "Resultado: channels=$status_channels ring=$status_ring coalesce=$status_coal"
+    log "Resultado: channels=$status_channels ring=$status_ring -> ${NIC_RESULT[$nic]}"
 }
 
 # ---------- MAIN ----------
@@ -624,7 +642,6 @@ echo
 echo "############################################################"
 echo "#  NIC Tuning - All Interfaces                             #"
 echo "#  Filas: NUMA-aware | Ring: MAX                           #"
-echo "#  Coalesce: arx=on atx=off rx-usecs=16 tx-frames=32       #"
 echo "############################################################"
 
 [[ $DRY_RUN -eq 1 ]] && warn "MODO DRY-RUN: nenhuma alteracao sera aplicada"
@@ -664,8 +681,9 @@ else
 fi
 
 if [[ ${#NICS[@]} -eq 0 ]]; then
-    err "Nenhuma NIC fisica detectada"
+    err "Nenhuma NIC fisica detectada (slaves de bond/bridge sao ignorados em auto-detect)"
     [[ $INCLUDE_WIRELESS -eq 0 ]] && log "Use --include-wireless para incluir interfaces wireless"
+    log "Use -i <nic> para forcar uma interface especifica"
     exit 1
 fi
 
@@ -681,11 +699,10 @@ echo
 echo "============================================================"
 echo "                        RESUMO"
 echo "============================================================"
-ok_count=0; fail_count=0; partial_count=0; unsup_count=0
+ok_count=0; fail_count=0; unsup_count=0
 for nic in "${NICS[@]}"; do
     case "${NIC_RESULT[$nic]:-unknown}" in
         ok)          ok    "$nic - tudo OK"               ; ok_count=$((ok_count+1)) ;;
-        partial)     warn  "$nic - parcialmente aplicado" ; partial_count=$((partial_count+1)) ;;
         fail)        err   "$nic - falhou"                ; fail_count=$((fail_count+1)) ;;
         unsupported) warn  "$nic - nao suportado"         ; unsup_count=$((unsup_count+1)) ;;
         *)           warn  "$nic - estado desconhecido" ;;
@@ -693,19 +710,19 @@ for nic in "${NICS[@]}"; do
 done
 
 echo
-echo "Total: $TOTAL_NICS | OK: $ok_count | Parcial: $partial_count | Falha: $fail_count | NaoSuportado: $unsup_count"
+echo "Total: $TOTAL_NICS | OK: $ok_count | Falha: $fail_count | NaoSuportado: $unsup_count"
 echo "============================================================"
 echo
-log "Para verificar: ethtool -l <nic> ; ethtool -g <nic> ; ethtool -c <nic>"
+log "Para verificar: ethtool -l <nic> ; ethtool -g <nic>"
 echo
 
 # Exit codes:
-#   0 = nada falhou
-#   1 = todas falharam
-#   2 = falha parcial em alguma NIC
+#   0 = nenhuma falha (pode ter unsupported)
+#   1 = todas as NICs falharam
+#   2 = falhas em algumas NICs (mix com OK)
 if [[ $fail_count -gt 0 && $ok_count -eq 0 ]]; then
     exit 1
-elif [[ $fail_count -gt 0 || $partial_count -gt 0 ]]; then
+elif [[ $fail_count -gt 0 ]]; then
     exit 2
 fi
 exit 0
