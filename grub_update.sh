@@ -1,129 +1,16 @@
 #!/bin/bash
 ###############################################################################
-#  CPU Performance Tuner v2.3
-#  Auto-detect CPU + Configurar GRUB + cpufrequtils + Ulimits
+#  CPU GRUB Tuner v1.0 (lite)
+#  Auto-detect CPU + Configurar GRUB (apenas)
 #  Foco: Streaming / Máximo throughput / Mínima latência de tráfego
-#  Compatível com: Intel Xeon, AMD Ryzen, AMD EPYC
+#  Compatível com: Intel Xeon, AMD Ryzen, AMD EPYC, AMD Threadripper
 #  Requer: root / sudo
+#
+#  Sem isolation NUMA, sem cpufrequtils, sem ulimits, sem systemd.
+#  Apenas edita GRUB_CMDLINE_LINUX_DEFAULT e roda update-grub.
 ###############################################################################
 
 set -euo pipefail
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Parser de argumentos
-# ─────────────────────────────────────────────────────────────────────────────
-NIC=""
-HOUSEKEEPING_OVERRIDE=""
-NO_HOUSEKEEPING=0
-ALL_CORES=0
-
-show_usage() {
-    cat <<USAGE
-Uso: $0 [OPÇÕES]
-
-OPÇÕES:
-  --nic <interface>          Indica a NIC primária para isolation NUMA-aware.
-                             O script detecta o NUMA da NIC e isola apenas
-                             os cores desse NUMA, deixando NUMAs remotos livres
-                             para o sistema. Exemplo: --nic enp1s0f0
-  --housekeeping <N>         (Opcional) Override do número de threads para
-                             housekeeping. Default: 1/2/4/8 conforme escala
-                             do NUMA (≤8/9-32/33-64/>64 threads).
-  --no-housekeeping          Reserva apenas o CPU 0 para o sistema, todos os
-                             outros cores ficam disponíveis para a aplicação.
-                             Útil quando o servidor é dedicado (sem MySQL etc).
-  --all                      Sem housekeeping nenhum: TODOS os cores do NUMA
-                             da NIC ficam isolados (incluindo CPU 0). Sem
-                             irqaffinity (IRQs distribuídas livremente). Use
-                             apenas se nic_tune.sh já cuida de IRQ pinning + XPS.
-  --help                     Mostra esta mensagem.
-
-EXEMPLOS:
-  # Modo padrão (sem isolation):
-  $0
-
-  # Com isolation NUMA-aware (recomendado para streaming):
-  $0 --nic enp1s0f0
-
-  # Override do count de housekeeping:
-  $0 --nic enp1s0f0 --housekeeping 4
-
-  # Apenas CPU 0 para sistema (servidor dedicado, sem MySQL):
-  $0 --nic enp1s0f0 --no-housekeeping
-
-  # Todos os cores para aplicação (com nic_tune.sh fazendo IRQ pinning):
-  $0 --nic enp1s0f0 --all
-
-USAGE
-}
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --nic)
-            if [[ -z "${2:-}" ]] || [[ "${2:-}" == --* ]]; then
-                echo "Erro: --nic requer um valor (ex: --nic enp1s0)" >&2
-                exit 1
-            fi
-            NIC="$2"
-            shift 2
-            ;;
-        --housekeeping)
-            if [[ -z "${2:-}" ]] || [[ "${2:-}" == --* ]]; then
-                echo "Erro: --housekeeping requer um valor numérico (ex: --housekeeping 4)" >&2
-                exit 1
-            fi
-            HOUSEKEEPING_OVERRIDE="$2"
-            shift 2
-            ;;
-        --no-housekeeping)
-            NO_HOUSEKEEPING=1
-            shift
-            ;;
-        --all)
-            ALL_CORES=1
-            shift
-            ;;
-        --help|-h)
-            show_usage
-            exit 0
-            ;;
-        *)
-            echo "Argumento desconhecido: $1" >&2
-            show_usage
-            exit 1
-            ;;
-    esac
-done
-
-# Validar combinações mutuamente exclusivas
-if [[ "$NO_HOUSEKEEPING" -eq 1 ]] && [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
-    echo "Erro: --no-housekeeping e --housekeeping são mutuamente exclusivos" >&2
-    exit 1
-fi
-if [[ "$ALL_CORES" -eq 1 ]] && [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
-    echo "Erro: --all e --housekeeping são mutuamente exclusivos" >&2
-    exit 1
-fi
-if [[ "$ALL_CORES" -eq 1 ]] && [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
-    echo "Erro: --all e --no-housekeeping são mutuamente exclusivos" >&2
-    exit 1
-fi
-
-# Validar que flags de isolation requerem --nic
-if [[ -z "$NIC" ]]; then
-    if [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
-        echo "Erro: --no-housekeeping requer --nic <interface>" >&2
-        exit 1
-    fi
-    if [[ "$ALL_CORES" -eq 1 ]]; then
-        echo "Erro: --all requer --nic <interface>" >&2
-        exit 1
-    fi
-    if [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
-        echo "Erro: --housekeeping requer --nic <interface>" >&2
-        exit 1
-    fi
-fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cores e formatação
@@ -152,242 +39,11 @@ fi
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   CPU Performance Tuner v2.3 - Maximum Streaming Throughput ║${NC}"
+echo -e "${BOLD}║         CPU GRUB Tuner v1.0 (lite) - GRUB only              ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FUNÇÕES DE DETECÇÃO E CÁLCULO PARA ISOLATION NUMA-AWARE
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Validar a NIC indicada e retornar seu NUMA node
-validate_nic_and_get_numa() {
-    local nic="$1"
-    if [[ ! -e "/sys/class/net/${nic}" ]]; then
-        log_error "NIC '${nic}' não existe em /sys/class/net/"
-        echo "  NICs disponíveis:" >&2
-        for n in /sys/class/net/*/; do
-            n=$(basename "$n")
-            [[ "$n" == "lo" ]] && continue
-            echo "    - $n" >&2
-        done
-        exit 1
-    fi
-    if [[ ! -e "/sys/class/net/${nic}/device" ]]; then
-        log_error "NIC '${nic}' é virtual (sem device PCIe) — isolation NUMA não aplicável"
-        exit 1
-    fi
-    if [[ ! -r "/sys/class/net/${nic}/device/numa_node" ]]; then
-        log_error "NIC '${nic}' não expõe informação NUMA"
-        exit 1
-    fi
-    local numa
-    numa=$(cat "/sys/class/net/${nic}/device/numa_node")
-    # numa_node = -1 em sistemas single-NUMA; tratar como NUMA 0
-    [[ "$numa" == "-1" ]] && numa=0
-    echo "$numa"
-}
-
-# Listar threads de um NUMA node (formato: "0-15,32-47" ou "0-31")
-get_numa_cpus() {
-    local node="$1"
-    local cpulist_file="/sys/devices/system/node/node${node}/cpulist"
-    if [[ -r "$cpulist_file" ]]; then
-        cat "$cpulist_file"
-    else
-        # Fallback para sistemas single-NUMA sem /sys/devices/system/node/
-        echo "0-$(( $(nproc) - 1 ))"
-    fi
-}
-
-# Contar threads em uma string de range "0-15,32-47" → 32
-count_threads_in_range() {
-    local range="$1"
-    [[ -z "$range" ]] && { echo 0; return; }
-    local total=0
-    local part start end
-    local parts
-    IFS=',' read -ra parts <<< "$range"
-    for part in "${parts[@]}"; do
-        if [[ "$part" == *-* ]]; then
-            start="${part%-*}"
-            end="${part#*-}"
-            total=$(( total + end - start + 1 ))
-        else
-            total=$(( total + 1 ))
-        fi
-    done
-    echo "$total"
-}
-
-# Expandir range "0-3,16-19" para lista "0 1 2 3 16 17 18 19"
-expand_range() {
-    local range="$1"
-    [[ -z "$range" ]] && { echo ""; return; }
-    local part start end i
-    local out=()
-    local parts
-    IFS=',' read -ra parts <<< "$range"
-    for part in "${parts[@]}"; do
-        if [[ "$part" == *-* ]]; then
-            start="${part%-*}"
-            end="${part#*-}"
-            for ((i=start; i<=end; i++)); do
-                out+=("$i")
-            done
-        else
-            out+=("$part")
-        fi
-    done
-    # Proteção contra array vazio em set -u
-    [[ ${#out[@]} -eq 0 ]] && { echo ""; return; }
-    echo "${out[@]}"
-}
-
-# Compactar lista "0 1 2 3 16 17 18 19" para range "0-3,16-19"
-compact_range() {
-    local input="$1"
-    local cpus
-    # Split intencional (input vem com espaços controlados, não há globbing)
-    read -ra cpus <<< "$input"
-    [[ ${#cpus[@]} -eq 0 ]] && { echo ""; return; }
-
-    # Ordenar numericamente
-    local sorted
-    sorted=$(printf "%s\n" "${cpus[@]}" | sort -n -u)
-    readarray -t cpus <<< "$sorted"
-
-    local result=""
-    local start="${cpus[0]}"
-    local prev="${cpus[0]}"
-    local i
-
-    for ((i=1; i<${#cpus[@]}; i++)); do
-        if [[ "${cpus[$i]}" -eq $((prev + 1)) ]]; then
-            prev="${cpus[$i]}"
-        else
-            if [[ "$start" == "$prev" ]]; then
-                result+="${start},"
-            else
-                result+="${start}-${prev},"
-            fi
-            start="${cpus[$i]}"
-            prev="${cpus[$i]}"
-        fi
-    done
-
-    if [[ "$start" == "$prev" ]]; then
-        result+="${start}"
-    else
-        result+="${start}-${prev}"
-    fi
-
-    echo "$result"
-}
-
-# Decidir housekeeping count baseado no número de threads do NUMA
-# Heurística: 1 (≤8) / 2 (≤32) / 4 (≤64) / 8 (>64)
-calc_housekeeping_count() {
-    local numa_threads="$1"
-    if [[ "$numa_threads" -le 8 ]]; then
-        echo 1
-    elif [[ "$numa_threads" -le 32 ]]; then
-        echo 2
-    elif [[ "$numa_threads" -le 64 ]]; then
-        echo 4
-    else
-        echo 8
-    fi
-}
-
-# Selecionar N threads housekeeping = SMT siblings dos N primeiros cores físicos
-# do NUMA. Retorna lista compactada (ex: "0,16" ou "0-3,32-35")
-select_housekeeping_threads() {
-    local numa_cpus="$1"
-    local hk_count="$2"
-
-    # Expandir lista de CPUs do NUMA
-    local numa_list
-    numa_list=$(expand_range "$numa_cpus")
-    local numa_arr
-    read -ra numa_arr <<< "$numa_list"
-
-    # Mapear cores físicos únicos com seus SMT siblings
-    declare -A core_to_threads
-    local cpu siblings core_id
-    for cpu in "${numa_arr[@]}"; do
-        local sib_file="/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list"
-        local core_file="/sys/devices/system/cpu/cpu${cpu}/topology/core_id"
-        [[ -r "$sib_file" ]] || continue
-        [[ -r "$core_file" ]] || continue
-
-        siblings=$(cat "$sib_file")
-        core_id=$(cat "$core_file")
-
-        # Usar core_id como chave (cores físicos únicos)
-        if [[ -z "${core_to_threads[$core_id]:-}" ]]; then
-            core_to_threads[$core_id]="$siblings"
-        fi
-    done
-
-    # Validar que conseguimos ler topology de pelo menos 1 core
-    if [[ ${#core_to_threads[@]} -eq 0 ]]; then
-        # Fallback: topology indisponível, usar primeiros hk_count threads diretos
-        # (não ideal mas evita travar — rara em hardware real, comum em containers/VMs minimal)
-        local fallback_threads=()
-        local i=0
-        for cpu in "${numa_arr[@]}"; do
-            [[ $i -ge $hk_count ]] && break
-            fallback_threads+=("$cpu")
-            i=$((i + 1))
-        done
-        compact_range "${fallback_threads[*]}"
-        return
-    fi
-
-    # Pegar os N primeiros cores físicos (ordenados por core_id numericamente)
-    local sorted_core_ids
-    sorted_core_ids=$(printf "%s\n" "${!core_to_threads[@]}" | sort -n)
-
-    local hk_threads=()
-    local count=0
-    while IFS= read -r cid; do
-        [[ "$count" -ge "$hk_count" ]] && break
-        # Adicionar todos os SMT siblings deste core físico
-        local thr_list
-        thr_list=$(expand_range "${core_to_threads[$cid]}")
-        for t in $thr_list; do
-            hk_threads+=("$t")
-        done
-        count=$((count + 1))
-    done <<< "$sorted_core_ids"
-
-    compact_range "${hk_threads[*]}"
-}
-
-# Calcular threads isolated = todos do NUMA menos os housekeeping
-calc_isolated_threads() {
-    local numa_cpus="$1"
-    local hk_range="$2"
-
-    local numa_list hk_list
-    numa_list=$(expand_range "$numa_cpus")
-    hk_list=$(expand_range "$hk_range")
-
-    declare -A hk_set
-    for t in $hk_list; do
-        hk_set[$t]=1
-    done
-
-    local isolated=()
-    for t in $numa_list; do
-        [[ -z "${hk_set[$t]:-}" ]] && isolated+=("$t")
-    done
-
-    compact_range "${isolated[*]}"
-}
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # Backup do GRUB
 # ─────────────────────────────────────────────────────────────────────────────
 GRUB_FILE="/etc/default/grub"
@@ -402,73 +58,7 @@ else
     exit 1
 fi
 
-log_section "1/8 - LIMPEZA DE CONFIGURAÇÕES ANTERIORES"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Remover persistências de execuções anteriores deste script (v1 e v2)
-# ─────────────────────────────────────────────────────────────────────────────
-OLD_FOUND=0
-
-# Serviço systemd
-if systemctl is-active cpu-performance.service &>/dev/null; then
-    systemctl stop cpu-performance.service &>/dev/null
-    log_info "Serviço cpu-performance.service parado"
-    OLD_FOUND=1
-fi
-if systemctl is-enabled cpu-performance.service &>/dev/null; then
-    systemctl disable cpu-performance.service &>/dev/null
-    log_info "Serviço cpu-performance.service desabilitado"
-    OLD_FOUND=1
-fi
-if [[ -f /etc/systemd/system/cpu-performance.service ]]; then
-    rm -f /etc/systemd/system/cpu-performance.service
-    systemctl daemon-reload &>/dev/null
-    log_info "Removido: /etc/systemd/system/cpu-performance.service"
-    OLD_FOUND=1
-fi
-
-# Boot script
-if [[ -f /usr/local/bin/cpu-performance-tuner.sh ]]; then
-    rm -f /usr/local/bin/cpu-performance-tuner.sh
-    log_info "Removido: /usr/local/bin/cpu-performance-tuner.sh"
-    OLD_FOUND=1
-fi
-
-# cpufrequtils config
-if [[ -f /etc/default/cpufrequtils ]]; then
-    rm -f /etc/default/cpufrequtils
-    log_info "Removido: /etc/default/cpufrequtils"
-    OLD_FOUND=1
-fi
-
-# Ulimits
-if [[ -f /etc/security/limits.d/99-streaming.conf ]]; then
-    rm -f /etc/security/limits.d/99-streaming.conf
-    log_info "Removido: /etc/security/limits.d/99-streaming.conf"
-    OLD_FOUND=1
-fi
-
-# Sysctl de versões anteriores (v1)
-if [[ -f /etc/sysctl.d/99-streaming-performance.conf ]]; then
-    rm -f /etc/sysctl.d/99-streaming-performance.conf
-    log_info "Removido: /etc/sysctl.d/99-streaming-performance.conf (v1)"
-    OLD_FOUND=1
-fi
-
-# Módulo bbr de versões anteriores (v1)
-if [[ -f /etc/modules-load.d/bbr.conf ]]; then
-    rm -f /etc/modules-load.d/bbr.conf
-    log_info "Removido: /etc/modules-load.d/bbr.conf (v1)"
-    OLD_FOUND=1
-fi
-
-if [[ $OLD_FOUND -eq 1 ]]; then
-    log_ok "Configurações anteriores removidas com sucesso"
-else
-    log_info "Nenhuma configuração anterior encontrada — instalação limpa"
-fi
-
-log_section "2/8 - DETECÇÃO DE HARDWARE"
+log_section "1/3 - DETECÇÃO DE HARDWARE"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Detectar CPU
@@ -476,32 +66,32 @@ log_section "2/8 - DETECÇÃO DE HARDWARE"
 VENDOR=$(grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
 MODEL_NAME=$(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')
 CPU_FAMILY=$(grep -m1 'cpu family' /proc/cpuinfo | awk '{print $4}')
-CPU_MODEL=$(awk -F: '/^model\t/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)
-[[ -z "$CPU_MODEL" ]] && CPU_MODEL=0
-THREADS=$(grep -c '^processor' /proc/cpuinfo)
+THREADS=$(grep -c '^processor' /proc/cpuinfo || echo 0)
 SOCKETS=$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l || true)
 [[ "$SOCKETS" -eq 0 ]] && SOCKETS=1
-CORES_PER_SOCKET=$(grep -m1 'cpu cores' /proc/cpuinfo | awk '{print $4}')
-[[ -z "$CORES_PER_SOCKET" ]] && CORES_PER_SOCKET="N/A"
+# Defesa: CPU_FAMILY pode estar vazio em containers minimal ou /proc não-padrão.
+# Comparações [[ "$CPU_FAMILY" -eq N ]] quebram com set -u se não-numérico.
+[[ "$CPU_FAMILY" =~ ^[0-9]+$ ]] || CPU_FAMILY=0
+[[ "$THREADS" =~ ^[0-9]+$ ]] || THREADS=1
 KERNEL_VER=$(uname -r)
 KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
 KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
-TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-TOTAL_RAM_GB=$(( TOTAL_RAM_KB / 1024 / 1024 ))
+# Defesa contra kernels custom com formato estranho — comparações usam -lt/-eq
+# e quebram em set -u se valor não for numérico. Default 0 quando não-numérico.
+[[ "$KERNEL_MAJOR" =~ ^[0-9]+$ ]] || KERNEL_MAJOR=0
+[[ "$KERNEL_MINOR" =~ ^[0-9]+$ ]] || KERNEL_MINOR=0
 
 log_info "CPU:               ${BOLD}${MODEL_NAME}${NC}"
 log_info "Vendor:            ${VENDOR}"
-log_info "Family/Model:      ${CPU_FAMILY}/${CPU_MODEL}"
+log_info "Family:            ${CPU_FAMILY}"
 log_info "Threads totais:    ${THREADS}"
 log_info "Sockets:           ${SOCKETS}"
-log_info "Cores por socket:  ${CORES_PER_SOCKET}"
-log_info "RAM total:         ${TOTAL_RAM_GB} GB"
 log_info "Kernel:            ${KERNEL_VER}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Classificar CPU e montar GRUB line
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "3/8 - MONTAGEM DA LINHA GRUB"
+log_section "2/3 - MONTAGEM DA LINHA GRUB"
 
 CPU_TYPE="unknown"
 PSTATE_DRIVER=""
@@ -576,14 +166,11 @@ COMMON_FLAGS+=" random.trust_cpu=on"
 # BLOCO 2: THP (permite hugepages opt-in)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#   rcu_nocbs=<range>                → Cores isolados offloadam RCU callbacks (gerado dinamicamente com --nic)
 #   transparent_hugepage=madvise     → THP opt-in (apps que pedem via madvise() ganham hugepages,
 #                                      apps de streaming com muitas alocações pequenas ficam em 4KB,
 #                                      evita latency spikes por compaction/defrag do khugepaged)
 #
 PERF_BOOT_FLAGS=""
-# rcu_nocbs será adicionado dinamicamente APENAS com isolation NUMA-aware (--nic).
-# Sem isolation, rcu_nocbs=all não traz benefício real (kthreads correm em qualquer core).
 PERF_BOOT_FLAGS+=" transparent_hugepage=madvise"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -610,12 +197,10 @@ if [[ "$VENDOR" == "GenuineIntel" ]]; then
     elif echo "$MODEL_NAME" | grep -qiE "xeon.*w-?[0-9]"; then
         CPU_TYPE="intel_xeon_w"
         log_ok "Tipo: Intel Xeon-W (Workstation — Sapphire Rapids-W / Ice Lake-W)"
-        EXTRA_NOTES+=("Xeon-W (workstation): sem dependência multi-socket, NUMA single-node")
 
     elif echo "$MODEL_NAME" | grep -qiE "xeon.*d-?[0-9]"; then
         CPU_TYPE="intel_xeon_d"
         log_ok "Tipo: Intel Xeon-D (Embedded — Skylake-D / Ice Lake-D)"
-        EXTRA_NOTES+=("Xeon-D (embedded): integrado, geralmente single-socket")
 
     elif echo "$MODEL_NAME" | grep -qiE "xeon.*(e5|e7|e3)"; then
         CPU_TYPE="intel_xeon_legacy"
@@ -625,7 +210,7 @@ if [[ "$VENDOR" == "GenuineIntel" ]]; then
         if [[ "$KERNEL_MAJOR" -lt 4 ]] || { [[ "$KERNEL_MAJOR" -eq 4 ]] && [[ "$KERNEL_MINOR" -lt 10 ]]; }; then
             log_warn "Kernel < 4.10: usando intel_pstate=disable (fallback acpi-cpufreq)"
             PSTATE_DRIVER="intel_pstate=disable"
-            EXTRA_NOTES+=("Xeon E-series com kernel antigo: governor será setado via cpufrequtils")
+            EXTRA_NOTES+=("Xeon E-series com kernel antigo: governor virá do cpufreq.default_governor=performance")
         fi
 
     elif echo "$MODEL_NAME" | grep -qiE "core.*(i[3579]|ultra)"; then
@@ -653,6 +238,10 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
         #   amd_iommu=on        → Ativa AMD-Vi IOMMU
         #   iommu=pt            → Passthrough
         #
+        # NOTA: NPS (Nodes Per Socket) é configuração de BIOS (Advanced > AMD CBS >
+        # DF Common Options > Memory Addressing > NUMA Nodes per Socket).
+        # Configurar nps=1 NO BIOS para EPYC multi-CCD em workloads de rede.
+        #
         CPU_TYPE="amd_epyc"
         PSTATE_DRIVER="amd_pstate=active"
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
@@ -664,27 +253,20 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
         # family 26 (0x1A) = Zen 5/Zen 5c   — Turin (9005)
         if [[ "$CPU_FAMILY" -eq 23 ]]; then
             log_info "Geração: Naples/Rome (Zen 1/Zen+/Zen 2) — family 23"
-            # Zen 1/2 EPYC: amd_pstate requer kernel 5.17+ E CPPC habilitado no BIOS.
-            # Em servidores antigos o BIOS frequentemente não expõe CPPC.
-            # Por segurança, deixamos acpi-cpufreq assumir.
             PSTATE_DRIVER=""
-            EXTRA_NOTES+=("EPYC Naples/Rome (Zen 1/2): amd_pstate não forçado — acpi-cpufreq usado (governor via GRUB)")
+            EXTRA_NOTES+=("EPYC Naples/Rome (Zen 1/2): amd_pstate não forçado — acpi-cpufreq usado")
 
         elif [[ "$CPU_FAMILY" -eq 25 ]]; then
             log_info "Geração: Milan/Genoa/Bergamo/Siena (Zen 3/Zen 4) — family 25"
-            # Zen 3 (Milan): amd_pstate em kernel 5.17+
-            # Zen 4 (Genoa/Bergamo/Siena): amd_pstate em kernel 6.3+ (guided), 6.5+ ideal
             if [[ "$KERNEL_MAJOR" -lt 5 ]] || { [[ "$KERNEL_MAJOR" -eq 5 ]] && [[ "$KERNEL_MINOR" -lt 17 ]]; }; then
                 log_warn "Kernel < 5.17: amd_pstate não disponível. Fallback para acpi-cpufreq."
                 PSTATE_DRIVER=""
                 EXTRA_NOTES+=("EPYC Zen 3/4 com kernel < 5.17: acpi-cpufreq usado como fallback")
             elif [[ "$KERNEL_MAJOR" -eq 6 ]] && [[ "$KERNEL_MINOR" -lt 3 ]]; then
-                # Zen 4 em kernel 5.17-6.2 funciona limitadamente — usar guided
                 PSTATE_DRIVER="amd_pstate=guided"
                 log_warn "Kernel < 6.3 com Zen 4: usando amd_pstate=guided como fallback."
                 EXTRA_NOTES+=("EPYC Zen 4 com kernel < 6.3: amd_pstate=guided (limitado)")
             fi
-            # Siena (EPYC 8000 series, Zen 4c) prefere kernel 6.5+
             if echo "$MODEL_NAME" | grep -qiE "EPYC 8[0-9][0-9][0-9]"; then
                 log_info "Sub-tipo: Siena (EPYC 8000 series, Zen 4c)"
                 if [[ "$KERNEL_MAJOR" -eq 6 ]] && [[ "$KERNEL_MINOR" -lt 5 ]]; then
@@ -695,7 +277,6 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
 
         elif [[ "$CPU_FAMILY" -eq 26 ]]; then
             log_info "Geração: Turin (Zen 5/Zen 5c) — family 26"
-            # Turin (EPYC 9005): amd_pstate funcional em kernel 6.4+, default em 6.13+
             if [[ "$KERNEL_MAJOR" -lt 6 ]] || { [[ "$KERNEL_MAJOR" -eq 6 ]] && [[ "$KERNEL_MINOR" -lt 4 ]]; }; then
                 log_warn "Kernel < 6.4: amd_pstate pode ser instável em Turin. Fallback para acpi-cpufreq."
                 PSTATE_DRIVER=""
@@ -705,33 +286,28 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
             fi
         else
             log_warn "EPYC com family ${CPU_FAMILY} desconhecida — usando configuração genérica"
-            EXTRA_NOTES+=("EPYC family ${CPU_FAMILY} não mapeada explicitamente — verifique kernel docs")
         fi
 
-        # Dual-socket EPYC
+        # Avisos para EPYC
+        EXTRA_NOTES+=("EPYC: configure nps=1 NO BIOS (Advanced > AMD CBS > DF Common Options) para multi-CCD")
         if [[ "$SOCKETS" -ge 2 ]]; then
             log_warn "Dual-socket EPYC (${SOCKETS} sockets) — NUMA pinning recomendado!"
-            EXTRA_NOTES+=("DUAL-SOCKET: Use 'numactl --cpunodebind=X --membind=X' para pinning do streaming ao socket local")
+            EXTRA_NOTES+=("DUAL-SOCKET: Use 'numactl --cpunodebind=X --membind=X' para pinning ao socket local")
         fi
 
     elif echo "$MODEL_NAME" | grep -qiE "Threadripper"; then
         # ── AMD Threadripper / Threadripper PRO ──
-        #   amd_pstate=active   → CPPC ativo (requer BIOS com CPPC habilitado)
-        #   amd_iommu=on        → Ativa AMD-Vi IOMMU
-        #   iommu=pt            → IOMMU em passthrough
-        #
         CPU_TYPE="amd_threadripper"
         PSTATE_DRIVER="amd_pstate=active"
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
 
-        # Detectar PRO (workstation com mais memory channels e PCIe lanes)
         if echo "$MODEL_NAME" | grep -qiE "Threadripper.*PRO|PRO.*[0-9]{4}WX"; then
             log_ok "Tipo: AMD Threadripper PRO (workstation/server)"
+            EXTRA_NOTES+=("Threadripper PRO: configure nps=1 NO BIOS para NUMA flat com múltiplos CCDs")
         else
             log_ok "Tipo: AMD Threadripper (HEDT consumer)"
         fi
 
-        # Ajustes por geração
         if [[ "$CPU_FAMILY" -eq 23 ]]; then
             log_info "Geração: Threadripper 1000/2000/3000 (Zen/Zen+/Zen 2) — family 23"
             PSTATE_DRIVER=""
@@ -752,20 +328,15 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
 
     elif echo "$MODEL_NAME" | grep -qiE "Ryzen"; then
         # ── AMD Ryzen (Desktop / Mobile / APU) ──
-        #   amd_pstate=active   → CPPC ativo (requer BIOS com CPPC habilitado)
-        #   amd_iommu=on        → Ativa AMD-Vi IOMMU
-        #   iommu=pt            → IOMMU em passthrough (zero overhead de tradução para DMA)
-        #
         CPU_TYPE="amd_ryzen"
         PSTATE_DRIVER="amd_pstate=active"
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
         log_ok "Tipo: AMD Ryzen (Desktop/Mobile/APU)"
 
-        # Ajustes por geração
         if [[ "$CPU_FAMILY" -eq 23 ]]; then
             log_info "Geração: Ryzen 1000/2000/3000 (Zen/Zen+/Zen 2) — family 23"
             PSTATE_DRIVER=""
-            EXTRA_NOTES+=("Ryzen Zen/Zen+/Zen 2: sem amd_pstate, usando acpi-cpufreq (governor via GRUB)")
+            EXTRA_NOTES+=("Ryzen Zen/Zen+/Zen 2: sem amd_pstate, usando acpi-cpufreq")
         elif [[ "$CPU_FAMILY" -eq 25 ]]; then
             log_info "Geração: Ryzen 5000/7000 (Zen 3/Zen 4) — family 25"
             if [[ "$KERNEL_MAJOR" -lt 5 ]] || { [[ "$KERNEL_MAJOR" -eq 5 ]] && [[ "$KERNEL_MINOR" -lt 17 ]]; }; then
@@ -787,7 +358,6 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
         log_ok "Tipo: AMD Genérico"
 
-        # CPUs AMD pre-Zen (family < 23): sem amd_pstate
         if [[ "$CPU_FAMILY" -lt 23 ]]; then
             log_warn "AMD pre-Zen detectado (family ${CPU_FAMILY}): sem amd_pstate"
             PSTATE_DRIVER=""
@@ -800,137 +370,12 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CÁLCULO DE ISOLATION FLAGS (NUMA-aware, ativado por --nic)
-# ══════════════════════════════════════════════════════════════════════════════
-ISOLATION_FLAGS=""
-HK_THREADS=""
-ISOLATED_THREADS=""
-NIC_NUMA=""
-NUMA_CPULIST=""
-NUMA_THREAD_COUNT=""
-HK_COUNT=""
-REMOTE_NUMAS=""
-
-if [[ -n "$NIC" ]]; then
-    log_section "ISOLATION NUMA-AWARE — análise da topologia"
-
-    # Validar NIC e descobrir NUMA
-    NIC_NUMA=$(validate_nic_and_get_numa "$NIC")
-    log_ok "NIC '${NIC}' está no NUMA node ${NIC_NUMA}"
-
-    # Listar threads do NUMA da NIC
-    NUMA_CPULIST=$(get_numa_cpus "$NIC_NUMA")
-    NUMA_THREAD_COUNT=$(count_threads_in_range "$NUMA_CPULIST")
-    log_info "Threads no NUMA ${NIC_NUMA}: ${NUMA_CPULIST} (total: ${NUMA_THREAD_COUNT})"
-
-    # Determinar housekeeping count e threads (4 modos)
-    if [[ "$ALL_CORES" -eq 1 ]]; then
-        # Modo --all: sem housekeeping, todos os cores do NUMA da NIC isolados
-        HK_COUNT=0
-        HK_THREADS=""
-        ISOLATED_THREADS="$NUMA_CPULIST"
-        log_info "Modo --all: todos os ${NUMA_THREAD_COUNT} cores do NUMA ${NIC_NUMA} isolados (sem housekeeping)"
-        log_warn "Sem irqaffinity — IRQs distribuídas livremente. Garanta que nic_tune.sh está pinando IRQs e XPS."
-    elif [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
-        # Modo --no-housekeeping: CPU 0 literal reservado, demais cores do NUMA isolados
-        HK_COUNT=1
-        HK_THREADS="0"
-        ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "0")
-        log_info "Modo --no-housekeeping: apenas CPU 0 reservado para o sistema"
-        # Se CPU 0 não está no NUMA da NIC, alertar que a reserva é "fora" do conjunto isolado
-        if ! [[ " $(expand_range "$NUMA_CPULIST") " == *" 0 "* ]]; then
-            log_warn "CPU 0 NÃO está no NUMA ${NIC_NUMA} da NIC — reserva acontece em NUMA remoto"
-            log_warn "Todos os cores do NUMA ${NIC_NUMA} foram isolados; --no-housekeeping aqui é equivalente a --all"
-        fi
-    elif [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
-        # Modo --housekeeping N: override do count
-        if ! [[ "$HOUSEKEEPING_OVERRIDE" =~ ^[0-9]+$ ]] || [[ "$HOUSEKEEPING_OVERRIDE" -lt 1 ]]; then
-            log_error "--housekeeping deve ser um inteiro positivo (recebido: '$HOUSEKEEPING_OVERRIDE')"
-            exit 1
-        fi
-        HK_COUNT="$HOUSEKEEPING_OVERRIDE"
-        log_info "Housekeeping count: ${HK_COUNT} (override via --housekeeping)"
-        HK_THREADS=$(select_housekeeping_threads "$NUMA_CPULIST" "$HK_COUNT")
-        ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "$HK_THREADS")
-    else
-        # Modo padrão: heurística baseada em threads do NUMA
-        HK_COUNT=$(calc_housekeeping_count "$NUMA_THREAD_COUNT")
-        log_info "Housekeeping count: ${HK_COUNT} threads (heurística automática)"
-        HK_THREADS=$(select_housekeeping_threads "$NUMA_CPULIST" "$HK_COUNT")
-        ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "$HK_THREADS")
-    fi
-
-    # Validar que sobram threads para isolation após reservar housekeeping
-    # (skip se --all, pois HK_COUNT=0 propositalmente)
-    if [[ "$ALL_CORES" -ne 1 ]] && [[ "$HK_COUNT" -ge "$NUMA_THREAD_COUNT" ]]; then
-        log_error "Housekeeping (${HK_COUNT}) >= threads do NUMA (${NUMA_THREAD_COUNT}). Não há threads para isolar."
-        exit 1
-    fi
-
-    # Validar: ISOLATED_THREADS deve ser não-vazio para produzir GRUB válido
-    # HK_THREADS pode ser vazio APENAS no modo --all
-    if [[ "$ALL_CORES" -ne 1 ]] && [[ -z "$HK_THREADS" ]]; then
-        log_error "Não foi possível determinar threads housekeeping (topology ausente?)"
-        exit 1
-    fi
-    if [[ -z "$ISOLATED_THREADS" ]]; then
-        log_error "Não há threads para isolar após reservar housekeeping"
-        log_error "  NUMA cpus: ${NUMA_CPULIST}, Housekeeping: ${HK_THREADS}"
-        exit 1
-    fi
-
-    if [[ -n "$HK_THREADS" ]]; then
-        log_ok "Housekeeping threads: ${HK_THREADS}"
-    else
-        log_ok "Housekeeping threads: (nenhum — modo --all)"
-    fi
-    log_ok "Isolated threads:     ${ISOLATED_THREADS}"
-
-    # Calcular NUMAs remotos (informativo)
-    # nullglob: se o glob não expandir, loop não roda (em vez de iterar o literal)
-    shopt -s nullglob
-    for node_dir in /sys/devices/system/node/node[0-9]*; do
-        n=$(basename "$node_dir" | sed 's/node//')
-        [[ "$n" == "$NIC_NUMA" ]] && continue
-        remote_cpus=$(cat "${node_dir}/cpulist" 2>/dev/null)
-        [[ -n "$remote_cpus" ]] && REMOTE_NUMAS+="NUMA ${n}: ${remote_cpus} | "
-    done
-    shopt -u nullglob
-    if [[ -n "$REMOTE_NUMAS" ]]; then
-        log_info "NUMAs remotos (livres para scheduler default): ${REMOTE_NUMAS%| }"
-    fi
-
-    # Montar ISOLATION_FLAGS
-    ISOLATION_FLAGS=" isolcpus=managed_irq,domain,${ISOLATED_THREADS}"
-    ISOLATION_FLAGS+=" nohz_full=${ISOLATED_THREADS}"
-    ISOLATION_FLAGS+=" rcu_nocbs=${ISOLATED_THREADS}"
-    # irqaffinity só faz sentido se há cores housekeeping. Em --all não há.
-    if [[ -n "$HK_THREADS" ]]; then
-        ISOLATION_FLAGS+=" irqaffinity=${HK_THREADS}"
-    fi
-
-    EXTRA_NOTES+=("Isolation: cores ${ISOLATED_THREADS} do NUMA ${NIC_NUMA} dedicados à aplicação")
-    if [[ "$ALL_CORES" -eq 1 ]]; then
-        EXTRA_NOTES+=("--all: SEM housekeeping — todos os ${NUMA_THREAD_COUNT} cores do NUMA ${NIC_NUMA} isolados")
-        EXTRA_NOTES+=("Sem irqaffinity — IRQs residuais (USB, disk, RCU kthreads) caem em qualquer core")
-        EXTRA_NOTES+=("REQUER nic_tune.sh já fazendo IRQ pinning + XPS, senão pode haver jitter")
-    elif [[ "$NO_HOUSEKEEPING" -eq 1 ]]; then
-        EXTRA_NOTES+=("--no-housekeeping: APENAS CPU ${HK_THREADS} reservado — todas as IRQs residuais ficam nesse 1 CPU")
-        EXTRA_NOTES+=("ATENÇÃO: em alta carga, CPU ${HK_THREADS} pode virar gargalo de IRQ handling")
-    else
-        EXTRA_NOTES+=("Housekeeping: cores ${HK_THREADS} (NUMA ${NIC_NUMA}) absorvem IRQs residuais e kernel work")
-    fi
-    [[ -n "$REMOTE_NUMAS" ]] && EXTRA_NOTES+=("NUMAs remotos livres para serviços não-críticos (PHP-FPM, MySQL, etc)")
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MONTAGEM FINAL DA LINHA GRUB
 # ══════════════════════════════════════════════════════════════════════════════
 GRUB_LINE="${PSTATE_DRIVER}"
 GRUB_LINE+="${COMMON_FLAGS}"
 GRUB_LINE+="${PERF_BOOT_FLAGS}"
 [[ -n "${INTEL_IDLE_FLAG}" ]] && GRUB_LINE+=" ${INTEL_IDLE_FLAG}"
-[[ -n "$ISOLATION_FLAGS" ]]  && GRUB_LINE+="${ISOLATION_FLAGS}"
 GRUB_LINE+=" ${IOMMU_FLAGS}"
 
 # Limpar espaços duplos e leading/trailing
@@ -945,7 +390,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 # Aplicar no GRUB
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "4/8 - APLICAR GRUB"
+log_section "3/3 - APLICAR GRUB"
 
 log_info "Backup: ${BACKUP_DIR}/grub.backup.${TIMESTAMP}"
 
@@ -962,7 +407,15 @@ if grep -q '^GRUB_CMDLINE_LINUX=' "$GRUB_FILE"; then
     EXISTING_GRUB_LINUX=$(grep '^GRUB_CMDLINE_LINUX=' "$GRUB_FILE" | sed 's/GRUB_CMDLINE_LINUX=//' | tr -d '"')
     if echo "$EXISTING_GRUB_LINUX" | grep -qE "quiet|splash"; then
         log_info "Removendo 'quiet splash' de GRUB_CMDLINE_LINUX..."
-        sed -i '/^GRUB_CMDLINE_LINUX=/s/\bquiet\b//g; /^GRUB_CMDLINE_LINUX=/s/\bsplash\b//g' "$GRUB_FILE"
+        # Remove quiet/splash, depois colapsa espaços múltiplos e limpa aspas com só espaço
+        sed -i '
+            /^GRUB_CMDLINE_LINUX=/ {
+                s/\bquiet\b//g
+                s/\bsplash\b//g
+                s/  */ /g
+                s/="\s*/="/
+                s/\s*"$/"/
+            }' "$GRUB_FILE"
     fi
 fi
 
@@ -996,302 +449,6 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instalar pacotes
-# ─────────────────────────────────────────────────────────────────────────────
-log_section "5/8 - INSTALAR PACOTES"
-
-install_packages() {
-    # Estratégia: suprimir TODA saída do gerenciador de pacotes (inclusive de pacotes
-    # quebrados pré-existentes como mlnx-ofed-dkms, drivers DKMS falhando, etc),
-    # tentar instalar os 3 pacotes que precisamos, e verificar pós-install.
-    # Erros em outros pacotes não-relacionados NÃO devem afetar este script.
-
-    local pkg
-    local pkgs_needed=()
-    local pkgs_missing=()
-
-    if command -v apt-get &>/dev/null; then
-        log_info "Gerenciador: apt (Debian/Ubuntu)"
-        export DEBIAN_FRONTEND=noninteractive
-
-        # Update silencioso — não aborta mesmo se algum repo quebrar
-        apt-get update -qq >/dev/null 2>&1 || true
-
-        # Tentar instalar — todo output (stdout+stderr) suprimido
-        apt-get install -y -qq cpufrequtils net-tools bc >/dev/null 2>&1 || true
-
-        # linux-tools: tentar versão específica do kernel atual
-        local KVER
-        KVER=$(uname -r)
-        if apt-get install -y -qq "linux-tools-${KVER}" >/dev/null 2>&1; then
-            log_ok "linux-tools instalado para kernel ${KVER}"
-        else
-            # Fallback para pacote genérico (kernels custom tipo XanMod não têm linux-tools específico)
-            apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 || true
-            log_info "linux-tools específico indisponível para kernel ${KVER} — script usará sysfs direto"
-        fi
-        pkgs_needed=(cpufrequtils net-tools bc)
-
-    elif command -v dnf &>/dev/null; then
-        log_info "Gerenciador: dnf (RHEL/Fedora)"
-        dnf install -y -q kernel-tools net-tools bc >/dev/null 2>&1 || true
-        pkgs_needed=(kernel-tools net-tools bc)
-
-    elif command -v yum &>/dev/null; then
-        log_info "Gerenciador: yum (CentOS)"
-        yum install -y -q kernel-tools net-tools bc >/dev/null 2>&1 || true
-        pkgs_needed=(kernel-tools net-tools bc)
-
-    elif command -v pacman &>/dev/null; then
-        log_info "Gerenciador: pacman (Arch)"
-        pacman -S --noconfirm --needed cpupower net-tools bc >/dev/null 2>&1 || true
-        pkgs_needed=(cpupower net-tools bc)
-
-    else
-        log_warn "Nenhum gerenciador de pacotes reconhecido (apt/dnf/yum/pacman)"
-        log_info "Prosseguindo sem instalar pacotes — script usará métodos sysfs direto"
-        return
-    fi
-
-    # Verificar pós-install: quais dos pacotes pedidos ficaram de fato instalados?
-    for pkg in "${pkgs_needed[@]}"; do
-        if command -v dpkg &>/dev/null; then
-            dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" && continue
-        elif command -v rpm &>/dev/null; then
-            rpm -q "$pkg" &>/dev/null && continue
-        elif command -v pacman &>/dev/null; then
-            pacman -Qi "$pkg" &>/dev/null && continue
-        fi
-        pkgs_missing+=("$pkg")
-    done
-
-    if [[ ${#pkgs_missing[@]} -eq 0 ]]; then
-        log_ok "Pacotes verificados: ${pkgs_needed[*]}"
-    else
-        log_warn "Pacotes não instalados: ${pkgs_missing[*]}"
-        log_info "O script usará sysfs direto — funciona sem estes pacotes"
-    fi
-}
-
-install_packages
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Governor performance + turbo (imediato)
-# ─────────────────────────────────────────────────────────────────────────────
-log_section "6/8 - GOVERNOR PERFORMANCE + TURBO BOOST"
-
-set_governor_now() {
-    local ok=0
-    local method=""
-    local avail_govs=""
-
-    # Verificar se cpufreq está disponível no kernel atual
-    if [[ ! -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
-        log_warn "cpufreq não disponível no kernel atual (driver não carregado)"
-        log_warn "Após reboot com o novo GRUB, o governor será aplicado automaticamente pelo serviço systemd"
-        return
-    fi
-
-    # Verificar se 'performance' está nos governors disponíveis
-    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors ]]; then
-        avail_govs=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null)
-        log_info "Governors disponíveis: ${avail_govs}"
-
-        if ! echo "$avail_govs" | grep -qw "performance"; then
-            # Tentar carregar o módulo do governor performance
-            modprobe cpufreq_performance 2>/dev/null || true
-
-            # Verificar novamente
-            avail_govs=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors 2>/dev/null)
-            if ! echo "$avail_govs" | grep -qw "performance"; then
-                log_warn "Governor 'performance' não disponível neste kernel/driver"
-                log_info "Driver atual: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo 'N/A')"
-                log_warn "Será aplicado após reboot com o novo GRUB"
-                return
-            fi
-        fi
-    fi
-
-    # Mostrar driver atual
-    local current_driver
-    current_driver=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null || echo "N/A")
-    log_info "Driver de frequência: ${current_driver}"
-
-    # ── Método 1: sysfs direto (mais confiável, funciona com qualquer kernel) ──
-    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-        if [[ -f "$gov" ]]; then
-            echo "performance" > "$gov" 2>/dev/null && ok=1
-        fi
-    done
-    if [[ $ok -eq 1 ]]; then
-        method="sysfs"
-    fi
-
-    # ── Método 2: cpupower (se sysfs falhou e cpupower funciona com este kernel) ──
-    if [[ $ok -eq 0 ]] && command -v cpupower &>/dev/null; then
-        if cpupower frequency-set -g performance &>/dev/null; then
-            ok=1
-            method="cpupower"
-        fi
-    fi
-
-    # ── Método 3: cpufreq-set (fallback) ──
-    if [[ $ok -eq 0 ]] && command -v cpufreq-set &>/dev/null; then
-        local any_set=0
-        local n
-        for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-            n=$(basename "$cpu" | sed 's/cpu//')
-            cpufreq-set -c "$n" -g performance &>/dev/null && any_set=1
-        done
-        if [[ $any_set -eq 1 ]]; then
-            ok=1
-            method="cpufreq-set"
-        fi
-    fi
-
-    # Resultado
-    if [[ $ok -eq 1 ]]; then
-        # Confirmar contando quantos cores ficaram em performance
-        local perf_count
-        perf_count=0
-        perf_count=$(grep -rl "performance" /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | wc -l) || perf_count=0
-        log_ok "Governor 'performance' aplicado via ${method} (${perf_count}/${THREADS} cores)"
-    else
-        log_warn "Não foi possível definir governor agora"
-        log_warn "Será aplicado automaticamente após reboot pelo serviço systemd"
-    fi
-}
-
-set_governor_now
-
-# Turbo/Boost
-if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
-    echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null
-    log_ok "Intel Turbo Boost: HABILITADO"
-fi
-if [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
-    echo 1 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
-    log_ok "AMD Boost: HABILITADO"
-fi
-
-# Energy Performance Preference → performance
-EPP_SET=0
-for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-    [[ -f "$epp" ]] && echo "performance" > "$epp" 2>/dev/null && EPP_SET=1
-done
-if [[ $EPP_SET -eq 1 ]]; then
-    log_ok "Energy Performance Preference → performance"
-else
-    log_info "EPP não disponível neste driver (normal para acpi-cpufreq)"
-fi
-
-# Não fazemos lock de scaling_min_freq = max (prejudica Precision Boost em AMD
-# e não traz benefício real em Intel com HWP/EPP em performance).
-
-# cpufrequtils persistente (Debian/Ubuntu)
-CPUFREQ_DEFAULT="/etc/default/cpufrequtils"
-cat > "$CPUFREQ_DEFAULT" <<'EOF'
-ENABLE="true"
-GOVERNOR="performance"
-MAX_SPEED="0"
-MIN_SPEED="0"
-EOF
-chmod 0644 "$CPUFREQ_DEFAULT"
-log_ok "Persistência: /etc/default/cpufrequtils → performance"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ulimits para processos de streaming
-# ─────────────────────────────────────────────────────────────────────────────
-log_section "7/8 - ULIMITS"
-
-# ── Limits (ulimits) para processos de streaming ──
-LIMITS_FILE="/etc/security/limits.d/99-streaming.conf"
-cat > "$LIMITS_FILE" <<'EOF'
-# Streaming Performance - File descriptors e prioridade
-*    soft    nofile    1048576
-*    hard    nofile    1048576
-*    soft    nproc     unlimited
-*    hard    nproc     unlimited
-*    soft    memlock   unlimited
-*    hard    memlock   unlimited
-root soft    nofile    1048576
-root hard    nofile    1048576
-EOF
-chmod 0644 "$LIMITS_FILE"
-log_ok "Ulimits configurados: ${LIMITS_FILE}"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Serviço systemd para persistência de TUDO no boot
-# ─────────────────────────────────────────────────────────────────────────────
-log_section "8/8 - SERVIÇO SYSTEMD PERSISTENTE"
-
-SYSTEMD_SERVICE="/etc/systemd/system/cpu-performance.service"
-TUNING_SCRIPT="/usr/local/bin/cpu-performance-tuner.sh"
-
-cat > "$TUNING_SCRIPT" <<'BOOTSCRIPT'
-#!/bin/bash
-###############################################################################
-# CPU Performance Tuner - Boot Script (executa a cada boot)
-# Reaplica: governor performance, turbo/boost, EPP performance
-###############################################################################
-
-LOG_TAG="cpu-perf-tuner"
-
-# ── 1. Carregar módulo governor performance (caso não esteja built-in) ──
-modprobe cpufreq_performance 2>/dev/null || true
-
-# ── 2. Aguardar cpufreq inicializar (pode demorar em boot) ──
-for i in 1 2 3 4 5; do
-    [ -d /sys/devices/system/cpu/cpu0/cpufreq ] && break
-    sleep 1
-done
-
-# ── 3. Governor performance em todos os cores ──
-for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -f "$gov" ] && echo "performance" > "$gov" 2>/dev/null
-done
-
-# ── 4. Turbo/Boost habilitado ──
-[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ] && echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null
-[ -f /sys/devices/system/cpu/cpufreq/boost ] && echo 1 > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null
-
-# ── 5. Energy Performance Preference → performance ──
-for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-    [ -f "$epp" ] && echo "performance" > "$epp" 2>/dev/null
-done
-
-# Não tocamos em scaling_min_freq nem em cpuidle/state*/disable.
-
-logger "$LOG_TAG: Boot tuning applied"
-BOOTSCRIPT
-
-chmod 0755 "$TUNING_SCRIPT"
-log_ok "Boot script: ${TUNING_SCRIPT}"
-
-cat > "$SYSTEMD_SERVICE" <<EOF
-[Unit]
-Description=CPU Performance Tuner for Streaming (v2.3)
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${TUNING_SCRIPT}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-chmod 0644 "$SYSTEMD_SERVICE"
-
-systemctl daemon-reload
-systemctl enable cpu-performance.service 2>/dev/null
-log_ok "Serviço cpu-performance.service habilitado no boot."
-
-# Executar agora
-bash "$TUNING_SCRIPT" 2>/dev/null || true
-log_ok "Tuning completo aplicado imediatamente."
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Relatório final
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -1304,59 +461,11 @@ echo -e "  ${BOLD}CPU${NC}              ${MODEL_NAME}"
 echo -e "  ${BOLD}Tipo${NC}             ${CPU_TYPE}"
 echo -e "  ${BOLD}Sockets${NC}          ${SOCKETS}"
 echo -e "  ${BOLD}Threads${NC}          ${THREADS}"
-echo -e "  ${BOLD}RAM${NC}              ${TOTAL_RAM_GB} GB"
 echo -e "  ${BOLD}Kernel${NC}           ${KERNEL_VER}"
 echo ""
 
-# Governor
-echo -e "  ${BOLD}Governor:${NC}"
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
-    GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-    PERF_COUNT=0
-    PERF_COUNT=$(grep -rl "performance" /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | wc -l) || PERF_COUNT=0
-    echo -e "    CPU0: ${GREEN}${GOV}${NC}  |  Total em performance: ${GREEN}${PERF_COUNT}/${THREADS}${NC}"
-else
-    echo -e "    ${YELLOW}Disponível após reboot${NC}"
-fi
-
-# Frequência
-echo -e "  ${BOLD}Frequência:${NC}"
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]]; then
-    CUR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
-    MAX=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
-    [[ -n "$CUR" ]] && echo -e "    Atual: ${GREEN}$(( CUR / 1000 )) MHz${NC}"
-    [[ -n "$MAX" ]] && echo -e "    Max:   ${GREEN}$(( MAX / 1000 )) MHz${NC}"
-else
-    echo -e "    ${YELLOW}Disponível após reboot (cpufreq não carregado)${NC}"
-fi
-
-# Turbo
-echo -e "  ${BOLD}Turbo/Boost:${NC}"
-if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
-    NT=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)
-    if [[ "$NT" -eq 0 ]]; then
-        echo -e "    ${GREEN}Intel Turbo: ON${NC}"
-    else
-        echo -e "    ${RED}Intel Turbo: OFF${NC}"
-    fi
-elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
-    B=$(cat /sys/devices/system/cpu/cpufreq/boost)
-    if [[ "$B" -eq 1 ]]; then
-        echo -e "    ${GREEN}AMD Boost: ON${NC}"
-    else
-        echo -e "    ${RED}AMD Boost: OFF${NC}"
-    fi
-else
-    echo -e "    ${YELLOW}Status não disponível via sysfs (verificar após reboot)${NC}"
-fi
-
-echo ""
-echo -e "  ${BOLD}Arquivos modificados/criados:${NC}"
+echo -e "  ${BOLD}Arquivos modificados:${NC}"
 echo "    ✓ ${GRUB_FILE} (backup: ${BACKUP_DIR}/grub.backup.${TIMESTAMP})"
-echo "    ✓ ${CPUFREQ_DEFAULT}"
-echo "    ✓ ${LIMITS_FILE}"
-echo "    ✓ ${TUNING_SCRIPT}"
-echo "    ✓ ${SYSTEMD_SERVICE}"
 
 if [[ ${#EXTRA_NOTES[@]} -gt 0 ]]; then
     echo ""
@@ -1366,39 +475,12 @@ if [[ ${#EXTRA_NOTES[@]} -gt 0 ]]; then
     done
 fi
 
-# Sugestão de pinning para systemd services se isolation foi aplicada
-if [[ -n "$ISOLATED_THREADS" ]]; then
-    echo ""
-    echo -e "  ${BOLD}${CYAN}Sugestão de pinning para seus systemd services:${NC}"
-    echo ""
-    echo -e "  ${CYAN}# Aplicação de streaming (XUI.One, nginx workers, FFmpeg):${NC}"
-    echo -e "  ${GREEN}# /etc/systemd/system/xuione.service.d/cpuaffinity.conf${NC}"
-    echo -e "  ${GREEN}[Service]${NC}"
-    echo -e "  ${GREEN}CPUAffinity=${ISOLATED_THREADS}${NC}"
-    echo ""
-    echo -e "  ${CYAN}# Mesmo CPUAffinity para nginx.service e qualquer outro serviço hot-path${NC}"
-    if [[ -n "$REMOTE_NUMAS" ]]; then
-        echo ""
-        echo -e "  ${CYAN}# Serviços não-críticos (PHP-FPM, MySQL) podem usar NUMA remoto:${NC}"
-        # Pegar o primeiro NUMA remoto como sugestão
-        first_remote=$(echo "$REMOTE_NUMAS" | awk -F'|' '{print $1}' | sed 's/.*: //')
-        echo -e "  ${GREEN}# /etc/systemd/system/php-fpm.service.d/cpuaffinity.conf${NC}"
-        echo -e "  ${GREEN}[Service]${NC}"
-        echo -e "  ${GREEN}CPUAffinity=${first_remote}${NC}"
-    fi
-    echo ""
-    echo -e "  ${CYAN}# Após criar os arquivos:${NC}"
-    echo -e "  ${GREEN}sudo systemctl daemon-reload${NC}"
-    echo -e "  ${GREEN}sudo systemctl restart xuione nginx${NC}"
-fi
-
 echo ""
 echo -e "  ${BOLD}${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "  ${BOLD}${YELLOW}║  REBOOT NECESSÁRIO para aplicar alterações do GRUB.            ║${NC}"
 echo -e "  ${BOLD}${YELLOW}║                                                                ║${NC}"
 echo -e "  ${BOLD}${YELLOW}║  Após reboot, verifique com:                                   ║${NC}"
 echo -e "  ${BOLD}${YELLOW}║    cat /proc/cmdline                                           ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║    cpupower frequency-info                                     ║${NC}"
 echo -e "  ${BOLD}${YELLOW}║    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   ║${NC}"
 echo -e "  ${BOLD}${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
