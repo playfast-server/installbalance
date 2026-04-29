@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-#  CPU Performance Tuner v2.0
+#  CPU Performance Tuner v2.1
 #  Auto-detect CPU + Configurar GRUB + cpufrequtils + Ulimits
 #  Foco: Streaming / Máximo throughput / Mínima latência de tráfego
 #  Compatível com: Intel Xeon, AMD Ryzen, AMD EPYC
@@ -27,8 +27,8 @@ OPÇÕES:
                              os cores desse NUMA, deixando NUMAs remotos livres
                              para o sistema. Exemplo: --nic enp1s0f0
   --housekeeping <N>         (Opcional) Override do número de threads para
-                             housekeeping. Default: 1/2/2/4/8 conforme escala
-                             do NUMA (≤8/9-16/17-32/33-64/>64 threads).
+                             housekeeping. Default: 1/2/4/8 conforme escala
+                             do NUMA (≤8/9-32/33-64/>64 threads).
   --no-housekeeping          Reserva apenas o CPU 0 para o sistema, todos os
                              outros cores ficam disponíveis para a aplicação.
                              Útil quando o servidor é dedicado (sem MySQL etc).
@@ -137,8 +137,8 @@ NC='\033[0m'
 
 log_info()    { echo -e "${CYAN}[INFO]${NC}  $1"; }
 log_ok()      { echo -e "${GREEN}[ OK ]${NC}  $1"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
-log_error()   { echo -e "${RED}[ERRO]${NC}  $1"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1" >&2; }
+log_error()   { echo -e "${RED}[ERRO]${NC}  $1" >&2; }
 log_section() { echo -e "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; echo -e "${BOLD}  $1${NC}"; echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ fi
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   CPU Performance Tuner v2.0 - Maximum Streaming Throughput ║${NC}"
+echo -e "${BOLD}║   CPU Performance Tuner v2.1 - Maximum Streaming Throughput ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -286,12 +286,11 @@ compact_range() {
 }
 
 # Decidir housekeeping count baseado no número de threads do NUMA
+# Heurística: 1 (≤8) / 2 (≤32) / 4 (≤64) / 8 (>64)
 calc_housekeeping_count() {
     local numa_threads="$1"
     if [[ "$numa_threads" -le 8 ]]; then
         echo 1
-    elif [[ "$numa_threads" -le 16 ]]; then
-        echo 2
     elif [[ "$numa_threads" -le 32 ]]; then
         echo 2
     elif [[ "$numa_threads" -le 64 ]]; then
@@ -506,81 +505,38 @@ log_section "3/8 - MONTAGEM DA LINHA GRUB"
 
 CPU_TYPE="unknown"
 PSTATE_DRIVER=""
-INTEL_IDLE_FLAG=""
 IOMMU_FLAGS=""
-NUMA_FLAGS=""
 EXTRA_NOTES=()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BLOCO 1: Parâmetros comuns — aplicados em Intel E AMD
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#   mitigations=off               → Desabilita TODAS as mitigações de CPU (Spectre, Meltdown, MDS, etc.) — MÁXIMO desempenho
-#   tsc=reliable                  → Marca o TSC como confiável (evita fallback para clocksources mais lentos)
-#   clocksource=tsc               → Força TSC como clocksource (menor overhead em gettimeofday/clock_gettime)
-#   hpet=disable                  → Desabilita HPET (evita interrupções lentas do timer legado)
-#   nowatchdog                    → Desabilita watchdog do kernel (remove interrupções NMI periódicas)
-#   nmi_watchdog=0                → Desabilita NMI watchdog especificamente (complementa nowatchdog)
-#   nosoftlockup                  → Desabilita detecção de softlockup (evita falsos alarmes)
-#   skew_tick=1                   → Desalinha ticks entre cores (reduz contenção de lock no timer tick)
-#   audit=0                       → Desabilita subsistema de auditoria (remove overhead de syscall logging)
-#   noresume                      → Desabilita resume de hibernação (boot mais rápido, sem busca de imagem)
-#   selinux=0                     → Desabilita SELinux (remove overhead de contexto de segurança em cada syscall)
-#   apparmor=0                    → Desabilita AppArmor (remove overhead de MAC)
-#   workqueue.power_efficient=0   → Desabilita mode power-efficient em workqueues (usa CPU local, não migra para economizar)
-#   pcie_aspm=off                 → Desabilita PCIe Active State Power Management (latência zero em dispositivos PCIe/NIC 25G+)
-#   cpufreq.default_governor=performance → Define governor performance no boot do kernel (kernel 5.9+), antes de qualquer userspace
-#   processor.max_cstate=1        → Permite apenas C0 e C1 (HLT raso). Proíbe C3/C6/C7 que têm latência alta (~100μs).
-#                                   Wake-up de C1 é ~1μs — ideal para streaming. Cores ociosos ainda podem dormir
-#                                   em C1 para liberar power budget, sem o overhead dos C-states profundos.
-#   init_on_alloc=0               → Não zerar páginas em alloc (kernel 5.3+ default é 1, ganho mensurável em apps
-#                                   com muito malloc/free como FFmpeg)
-#   init_on_free=0                → Não zerar páginas em free (mesmo princípio)
-#   vsyscall=none                 → Desabilita emulação de vsyscall legacy (segurança + performance)
-#   random.trust_cpu=on           → Usa RDRAND/RDSEED como fonte de entropia (boot rápido + SSL handshakes rápidos)
+#   mitigations=off                       → Desabilita TODAS as mitigações de CPU (Spectre, Meltdown, MDS, etc.) — MÁXIMO desempenho
+#   nowatchdog                            → Desabilita watchdog do kernel (remove interrupções NMI periódicas)
+#   nmi_watchdog=0                        → Desabilita NMI watchdog especificamente (complementa nowatchdog)
+#   audit=0                               → Desabilita subsistema de auditoria (remove overhead de syscall logging)
+#   cpufreq.default_governor=performance  → Define governor performance no boot do kernel (kernel 5.9+), antes de qualquer userspace
+#   random.trust_cpu=on                   → Usa RDRAND/RDSEED como fonte de entropia (boot rápido + SSL handshakes rápidos)
 #
 COMMON_FLAGS=""
 COMMON_FLAGS+=" mitigations=off"
-COMMON_FLAGS+=" tsc=reliable"
-COMMON_FLAGS+=" clocksource=tsc"
-COMMON_FLAGS+=" hpet=disable"
 COMMON_FLAGS+=" nowatchdog"
 COMMON_FLAGS+=" nmi_watchdog=0"
-COMMON_FLAGS+=" nosoftlockup"
-COMMON_FLAGS+=" skew_tick=1"
 COMMON_FLAGS+=" audit=0"
-COMMON_FLAGS+=" noresume"
-COMMON_FLAGS+=" selinux=0"
-COMMON_FLAGS+=" apparmor=0"
-COMMON_FLAGS+=" workqueue.power_efficient=0"
-COMMON_FLAGS+=" pcie_aspm=off"
 COMMON_FLAGS+=" cpufreq.default_governor=performance"
-COMMON_FLAGS+=" processor.max_cstate=1"
-COMMON_FLAGS+=" init_on_alloc=0"
-COMMON_FLAGS+=" init_on_free=0"
-COMMON_FLAGS+=" vsyscall=none"
 COMMON_FLAGS+=" random.trust_cpu=on"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTA SOBRE C-STATE POLICY
-# ══════════════════════════════════════════════════════════════════════════════
-# processor.max_cstate=1 é o meio termo universal para streaming:
-# permite C0+C1 (HLT, wake-up ~1μs) mas proíbe C3/C6/C7 (latência 100μs+).
-# Cores ociosos dormem em C1 liberando power budget sem o overhead dos
-# C-states profundos. Funciona em Intel e AMD.
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 2: RCU + THP (reduz jitter e permite hugepages opt-in)
+# BLOCO 2: THP (permite hugepages opt-in)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-#   rcupdate.rcu_expedited=1         → Grace periods expeditos (callbacks mais rápido)
 #   rcu_nocbs=<range>                → Cores isolados offloadam RCU callbacks (gerado dinamicamente com --nic)
 #   transparent_hugepage=madvise     → THP opt-in (apps que pedem via madvise() ganham hugepages,
 #                                      apps de streaming com muitas alocações pequenas ficam em 4KB,
 #                                      evita latency spikes por compaction/defrag do khugepaged)
 #
 PERF_BOOT_FLAGS=""
-PERF_BOOT_FLAGS+=" rcupdate.rcu_expedited=1"
 # rcu_nocbs será adicionado dinamicamente APENAS com isolation NUMA-aware (--nic).
 # Sem isolation, rcu_nocbs=all não traz benefício real (kthreads correm em qualquer core).
 PERF_BOOT_FLAGS+=" transparent_hugepage=madvise"
@@ -592,14 +548,10 @@ PERF_BOOT_FLAGS+=" transparent_hugepage=madvise"
 if [[ "$VENDOR" == "GenuineIntel" ]]; then
     # ── INTEL ──────────────────────────────────────────────────────────────
     #   intel_pstate=active          → Driver Intel P-state em modo active (HWP direto)
-    #   intel_idle.max_cstate=1      → Limita o driver intel_idle a C0+C1 (complementa processor.max_cstate=1).
-    #                                  Mantém o driver carregado (com observabilidade via sysfs) mas restringe
-    #                                  aos estados rasos. Wake-up via MWAIT ~1μs.
     #   intel_iommu=on               → Ativa Intel VT-d IOMMU
     #   iommu=pt                     → IOMMU em passthrough (zero overhead de tradução para DMA)
     #
     PSTATE_DRIVER="intel_pstate=active"
-    INTEL_IDLE_FLAG="intel_idle.max_cstate=1"
     IOMMU_FLAGS="intel_iommu=on iommu=pt"
 
     if echo "$MODEL_NAME" | grep -qiE "xeon.*(gold|platinum|silver|bronze)"; then
@@ -643,8 +595,7 @@ if [[ "$VENDOR" == "GenuineIntel" ]]; then
 
 elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
     # ── AMD ────────────────────────────────────────────────────────────────
-    # Política C-state unificada via processor.max_cstate=1 (em COMMON_FLAGS).
-    # Cores ociosos entram em C1 (HLT, wake-up ~1μs) liberando PPT budget
+    # Cores ociosos podem entrar em C-states profundos liberando PPT budget
     # para cores ativos boostarem ao máximo via Precision Boost.
 
     if echo "$MODEL_NAME" | grep -qiE "EPYC"; then
@@ -652,12 +603,10 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
         #   amd_pstate=active   → Driver AMD P-state com CPPC ativo (requer kernel + BIOS suportar)
         #   amd_iommu=on        → Ativa AMD-Vi IOMMU
         #   iommu=pt            → Passthrough
-        #   nps=1               → Nodes Per Socket = 1 (NUMA flat, sem fragmentação inter-CCD)
         #
         CPU_TYPE="amd_epyc"
         PSTATE_DRIVER="amd_pstate=active"
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
-        NUMA_FLAGS="nps=1"
         log_ok "Tipo: AMD EPYC Server"
 
         # Ajustes por geração (mapeamento family→Zen do kernel Linux):
@@ -721,20 +670,16 @@ elif [[ "$VENDOR" == "AuthenticAMD" ]]; then
         #   amd_pstate=active   → CPPC ativo (requer BIOS com CPPC habilitado)
         #   amd_iommu=on        → Ativa AMD-Vi IOMMU
         #   iommu=pt            → IOMMU em passthrough
-        #   nps=1               → NUMA flat (essencial em multi-CCD, especialmente PRO)
         #
         CPU_TYPE="amd_threadripper"
         PSTATE_DRIVER="amd_pstate=active"
         IOMMU_FLAGS="amd_iommu=on iommu=pt"
-        NUMA_FLAGS="nps=1"
 
         # Detectar PRO (workstation com mais memory channels e PCIe lanes)
         if echo "$MODEL_NAME" | grep -qiE "Threadripper.*PRO|PRO.*[0-9]{4}WX"; then
             log_ok "Tipo: AMD Threadripper PRO (workstation/server)"
-            EXTRA_NOTES+=("Threadripper PRO: nps=1 essencial para NUMA flat com múltiplos CCDs")
         else
             log_ok "Tipo: AMD Threadripper (HEDT consumer)"
-            EXTRA_NOTES+=("Threadripper: nps=1 adicionado para NUMA flat")
         fi
 
         # Ajustes por geração
@@ -843,6 +788,11 @@ if [[ -n "$NIC" ]]; then
         HK_THREADS="0"
         ISOLATED_THREADS=$(calc_isolated_threads "$NUMA_CPULIST" "0")
         log_info "Modo --no-housekeeping: apenas CPU 0 reservado para o sistema"
+        # Se CPU 0 não está no NUMA da NIC, alertar que a reserva é "fora" do conjunto isolado
+        if ! [[ " $(expand_range "$NUMA_CPULIST") " == *" 0 "* ]]; then
+            log_warn "CPU 0 NÃO está no NUMA ${NIC_NUMA} da NIC — reserva acontece em NUMA remoto"
+            log_warn "Todos os cores do NUMA ${NIC_NUMA} foram isolados; --no-housekeeping aqui é equivalente a --all"
+        fi
     elif [[ -n "$HOUSEKEEPING_OVERRIDE" ]]; then
         # Modo --housekeeping N: override do count
         if ! [[ "$HOUSEKEEPING_OVERRIDE" =~ ^[0-9]+$ ]] || [[ "$HOUSEKEEPING_OVERRIDE" -lt 1 ]]; then
@@ -888,12 +838,15 @@ if [[ -n "$NIC" ]]; then
     log_ok "Isolated threads:     ${ISOLATED_THREADS}"
 
     # Calcular NUMAs remotos (informativo)
+    # nullglob: se o glob não expandir, loop não roda (em vez de iterar o literal)
+    shopt -s nullglob
     for node_dir in /sys/devices/system/node/node[0-9]*; do
         n=$(basename "$node_dir" | sed 's/node//')
         [[ "$n" == "$NIC_NUMA" ]] && continue
         remote_cpus=$(cat "${node_dir}/cpulist" 2>/dev/null)
         [[ -n "$remote_cpus" ]] && REMOTE_NUMAS+="NUMA ${n}: ${remote_cpus} | "
     done
+    shopt -u nullglob
     if [[ -n "$REMOTE_NUMAS" ]]; then
         log_info "NUMAs remotos (livres para scheduler default): ${REMOTE_NUMAS%| }"
     fi
@@ -927,8 +880,6 @@ fi
 GRUB_LINE="${PSTATE_DRIVER}"
 GRUB_LINE+="${COMMON_FLAGS}"
 GRUB_LINE+="${PERF_BOOT_FLAGS}"
-[[ -n "${INTEL_IDLE_FLAG}" ]] && GRUB_LINE+=" ${INTEL_IDLE_FLAG}"
-[[ -n "$NUMA_FLAGS" ]]       && GRUB_LINE+=" ${NUMA_FLAGS}"
 [[ -n "$ISOLATION_FLAGS" ]]  && GRUB_LINE+="${ISOLATION_FLAGS}"
 GRUB_LINE+=" ${IOMMU_FLAGS}"
 
@@ -1020,6 +971,7 @@ install_packages() {
         apt-get install -y -qq cpufrequtils net-tools bc >/dev/null 2>&1 || true
 
         # linux-tools: tentar versão específica do kernel atual
+        local KVER
         KVER=$(uname -r)
         if apt-get install -y -qq "linux-tools-${KVER}" >/dev/null 2>&1; then
             log_ok "linux-tools instalado para kernel ${KVER}"
@@ -1136,6 +1088,7 @@ set_governor_now() {
     # ── Método 3: cpufreq-set (fallback) ──
     if [[ $ok -eq 0 ]] && command -v cpufreq-set &>/dev/null; then
         local any_set=0
+        local n
         for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
             n=$(basename "$cpu" | sed 's/cpu//')
             cpufreq-set -c "$n" -g performance &>/dev/null && any_set=1
@@ -1182,11 +1135,8 @@ else
     log_info "EPP não disponível neste driver (normal para acpi-cpufreq)"
 fi
 
-# Política C-state via GRUB (processor.max_cstate=1) é suficiente.
 # Não fazemos lock de scaling_min_freq = max (prejudica Precision Boost em AMD
 # e não traz benefício real em Intel com HWP/EPP em performance).
-# Não forçamos C-states off via sysfs — max_cstate=1 no boot já limita a C1.
-log_info "Política C-state: processor.max_cstate=1 via GRUB (permite C1 para liberar power budget)"
 
 # cpufrequtils persistente (Debian/Ubuntu)
 CPUFREQ_DEFAULT="/etc/default/cpufrequtils"
@@ -1233,7 +1183,6 @@ cat > "$TUNING_SCRIPT" <<'BOOTSCRIPT'
 ###############################################################################
 # CPU Performance Tuner - Boot Script (executa a cada boot)
 # Reaplica: governor performance, turbo/boost, EPP performance
-# Nota: C-state policy vem do GRUB (processor.max_cstate=1), não do sysfs
 ###############################################################################
 
 LOG_TAG="cpu-perf-tuner"
@@ -1261,7 +1210,6 @@ for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; d
     [ -f "$epp" ] && echo "performance" > "$epp" 2>/dev/null
 done
 
-# Nota: C-state policy vem do GRUB (processor.max_cstate=1).
 # Não tocamos em scaling_min_freq nem em cpuidle/state*/disable.
 
 logger "$LOG_TAG: Boot tuning applied"
@@ -1272,7 +1220,7 @@ log_ok "Boot script: ${TUNING_SCRIPT}"
 
 cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
-Description=CPU Performance Tuner for Streaming (v2.0)
+Description=CPU Performance Tuner for Streaming (v2.1)
 After=multi-user.target
 
 [Service]
@@ -1395,12 +1343,12 @@ if [[ -n "$ISOLATED_THREADS" ]]; then
 fi
 
 echo ""
-echo -e "  ${BOLD}${YELLOW}╔════════════════════════════════════════════════════════════╗${NC}"
-echo -e "  ${BOLD}${YELLOW}║  REBOOT NECESSÁRIO para aplicar alterações do GRUB.       ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║                                                            ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║  Após reboot, verifique com:                               ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║    cat /proc/cmdline                                       ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║    cpupower frequency-info                                 ║${NC}"
-echo -e "  ${BOLD}${YELLOW}║    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor║${NC}"
-echo -e "  ${BOLD}${YELLOW}╚════════════════════════════════════════════════════════════╝${NC}"
+echo -e "  ${BOLD}${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "  ${BOLD}${YELLOW}║  REBOOT NECESSÁRIO para aplicar alterações do GRUB.            ║${NC}"
+echo -e "  ${BOLD}${YELLOW}║                                                                ║${NC}"
+echo -e "  ${BOLD}${YELLOW}║  Após reboot, verifique com:                                   ║${NC}"
+echo -e "  ${BOLD}${YELLOW}║    cat /proc/cmdline                                           ║${NC}"
+echo -e "  ${BOLD}${YELLOW}║    cpupower frequency-info                                     ║${NC}"
+echo -e "  ${BOLD}${YELLOW}║    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor   ║${NC}"
+echo -e "  ${BOLD}${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
