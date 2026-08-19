@@ -61,6 +61,14 @@
 
 set -euo pipefail
 
+# O auto-detect de topologia roda em heredocs de python3. Sem isto, o python usa o encoding do
+# LOCALE para o stdout: num host com LANG=*.ISO-8859-1 (ou qualquer locale latin-1), um simples
+# travessao numa mensagem de warning derruba o script com UnicodeEncodeError no meio do
+# preflight. Fixar o encoding torna o comportamento independente do locale do host.
+# (Os blocos python tambem sao mantidos ASCII-only, para o texto seguir legivel num terminal
+# que nao seja UTF-8.)
+export PYTHONIOENCODING=utf-8
+
 # ---------------- config ----------------
 
 STAMP="$(date +%Y-%m-%d-%H%M%S)"
@@ -77,6 +85,7 @@ NUMA_FILTER=1     # 1 = filtra por NUMA da NIC; 0 = ignora (CPUs online globais)
 PERSIST=1
 DRY_RUN=0
 PRINT_HELPER=0     # --print-helper: emite o helper embutido e sai
+PRINT_TOPOLOGY=0   # --print-topology: imprime a topologia detectada e sai
 ROLLBACK=0
 APPLY_XPS=0
 APPLY_RPS=0
@@ -159,17 +168,18 @@ while [[ $# -gt 0 ]]; do
     --no-offloads)          APPLY_OFFLOADS=0 ;;
     --no-qdisc)             APPLY_QDISC=0 ;;
     --print-helper)         PRINT_HELPER=1 ;;
+    --print-topology)       PRINT_TOPOLOGY=1 ;;
     -h|--help)              usage; exit 0 ;;
     *) err "arg desconhecido: $1"; usage; exit 1 ;;
   esac
   shift
 done
 
-(( PRINT_HELPER )) || [[ -n "$IFACE" ]] || { err "--nic <nome> é obrigatório (ex.: --nic eth0)"; usage; exit 1; }
+(( PRINT_HELPER )) || (( PRINT_TOPOLOGY )) || [[ -n "$IFACE" ]] || { err "--nic <nome> é obrigatório (ex.: --nic eth0)"; usage; exit 1; }
 
 # --print-helper é só leitura: dispensa root. O dispatch em si acontece no início de
 # main(), depois que emit_helper() já foi definida.
-(( PRINT_HELPER )) || (( EUID == 0 )) || { err "rode como root."; exit 1; }
+(( PRINT_HELPER )) || (( PRINT_TOPOLOGY )) || (( EUID == 0 )) || { err "rode como root."; exit 1; }
 
 # Normalização/validação antes de QUALQUER uso (inclusive em --dry-run).
 CPUS=$(normalize_cpulist --cpus "$CPUS")
@@ -196,75 +206,294 @@ PY
 
 # ---------------- auto-detect cpus ----------------
 
-autodetect_cpus_for_iface() {
-  # Lista de CPUs online; intersecciona com NUMA-local da NIC se NUMA_FILTER=1.
-  # Output: linha 1 = cpulist; linha 2 = "numa=N" (ou "numa=-1" se sem filtro/aplicado);
-  # linha 3 = "note=<warning>" se houve degradação do filtro NUMA.
-  local iface="$1"
-  python3 - "$iface" "$NUMA_FILTER" <<'PY'
-import sys, os
-iface = sys.argv[1]
-numa_filter = sys.argv[2] == "1"
+# Emite, em JSON, a topologia detectada + a lista de CPUs escolhida para a NIC.
+# Consumido por preflight() e por --print-topology.
+topology_json() {
+  python3 - "$IFACE" "$NUMA_FILTER" <<'PY'
+import sys
+# >>> TOPOLOGY_LIB v1 >>> bloco IDENTICO nos 3 scripts (verifique com --print-topology-src)
+# Detector de topologia de CPU. Resolve o "dominio de cache" (CCX no AMD, LLC/cluster/die
+# em geral) por uma cadeia de fontes, VALIDANDO cada uma antes de aceitar:
+#   1. LLC real  - maior nivel de cache Unified/Data exposto (normalmente L3, cai p/ L2)
+#   2. NUMA node - quando ha mais de um node e ele particiona mais fino que o socket
+#   3. die       - die_cpus_list, quando mais fino que o socket
+#   4. cluster   - cluster_cpus_list, so com cluster_id valido E mais grosso que um core
+#   5. socket    - core_siblings_list
+#   6. core      - thread_siblings_list (ultimo recurso; nao respeita fronteira de cache)
+# Validacao aplicada a toda fonte: os dominios precisam PARTICIONAR exatamente o conjunto de
+# CPUs online (sem sobreposicao, sem faltar CPU). Fonte que nao particiona e descartada com
+# warning, e a cadeia continua - assim um sysfs incompleto degrada em vez de mentir.
+# SYSFS_ROOT permite apontar para uma arvore de fixtures em teste.
+import os, glob, json
 
-def cpus_in(spec):
+SYSFS = os.environ.get("TOPO_SYSFS_ROOT", "") or ""
+def _p(path): return SYSFS + path
+
+def _read(path):
+    try:
+        with open(_p(path)) as f: return f.read().strip()
+    except Exception: return None
+
+def _cpus_in(spec):
     out = set()
+    if not spec: return out
     for tok in spec.split(','):
         tok = tok.strip()
         if not tok: continue
         if '-' in tok:
-            a, b = map(int, tok.split('-'))
-            out |= set(range(a, b + 1))
-        else:
+            a, b = tok.split('-')[:2]
+            try: out |= set(range(int(a), int(b) + 1))
+            except ValueError: pass
+        elif tok.isdigit():
             out.add(int(tok))
     return out
 
-def fmt(s):
-    if not s: return ""
-    arr = sorted(s); ranges = []; i = 0
-    while i < len(arr):
+def _fmt(cpus):
+    if not cpus: return ""
+    a = sorted(cpus); r = []; i = 0
+    while i < len(a):
         j = i
-        while j+1 < len(arr) and arr[j+1] == arr[j]+1: j += 1
-        ranges.append(f"{arr[i]}-{arr[j]}" if j>i else f"{arr[i]}")
-        i = j+1
-    return ",".join(ranges)
+        while j + 1 < len(a) and a[j + 1] == a[j] + 1: j += 1
+        r.append(f"{a[i]}-{a[j]}" if j > i else f"{a[i]}")
+        i = j + 1
+    return ",".join(r)
 
-with open('/sys/devices/system/cpu/online') as f:
-    online = cpus_in(f.read().strip())
+def _online():
+    s = _read('/sys/devices/system/cpu/online')
+    if s: return _cpus_in(s)
+    out = set()
+    for d in glob.glob(_p('/sys/devices/system/cpu/cpu[0-9]*')):
+        n = d.rsplit('cpu', 1)[1]
+        if n.isdigit(): out.add(int(n))
+    return out
+
+def _cpuinfo():
+    txt = _read('/proc/cpuinfo') or ''
+    ven = mod = ''
+    for line in txt.splitlines():
+        if not ven and line.startswith('vendor_id'): ven = line.split(':', 1)[1].strip()
+        elif not mod and line.startswith('model name'): mod = line.split(':', 1)[1].strip()
+        if ven and mod: break
+    return ven, mod
+
+def _caches(online):
+    """Todos os niveis de cache vistos, agrupados por shared_cpu_list."""
+    levels = {}
+    for c in sorted(online):
+        base = f'/sys/devices/system/cpu/cpu{c}/cache'
+        for idx in sorted(glob.glob(_p(f'{base}/index[0-9]*')),
+                          key=lambda p: int(p.rsplit('index', 1)[1])):
+            rel = idx[len(SYSFS):] if SYSFS else idx
+            lv = _read(f'{rel}/level'); ty = _read(f'{rel}/type') or ''
+            if not lv or not lv.isdigit(): continue
+            if ty.lower() == 'instruction': continue      # I-cache nao define dominio
+            shared = _read(f'{rel}/shared_cpu_list')
+            if not shared: continue
+            lv = int(lv)
+            e = levels.setdefault(lv, {"level": lv, "type": ty,
+                                       "size": _read(f'{rel}/size'), "domains": []})
+            if shared not in e["domains"]: e["domains"].append(shared)
+    return [levels[k] for k in sorted(levels)]
+
+def _partitions(domains, online):
+    """A fonte particiona exatamente as CPUs online?"""
+    seen = set(); total = 0
+    for d in domains:
+        s = _cpus_in(d) & online
+        if not s: return False
+        if s & seen: return False        # sobreposicao
+        seen |= s; total += len(s)
+    return seen == online and total == len(online)
+
+def _group_by(attr_file, online):
+    """Agrupa CPUs online pelo conteudo de topology/<attr_file>, preservando a ordem."""
+    doms = []
+    for c in sorted(online):
+        v = _read(f'/sys/devices/system/cpu/cpu{c}/topology/{attr_file}')
+        if not v: return []
+        if v not in doms: doms.append(v)
+    return doms
+
+def detect_topology():
+    online = _online()
+    ven, model = _cpuinfo()
+    t = {"vendor": ven, "model": model, "online": _fmt(online), "n_online": len(online),
+         "warnings": [], "caches": [], "numa_nodes": {}, "domains": [],
+         "domain_source": None, "domain_label": None}
+    if not online:
+        t["warnings"].append("nenhuma CPU online detectada")
+        return t
+
+    # --- identidades por CPU ---
+    threads = _group_by('thread_siblings_list', online)
+    sockets = _group_by('core_siblings_list', online) or _group_by('package_cpus_list', online)
+    t["n_cores"] = len(threads) if threads else len(online)
+    t["threads_per_core"] = round(len(online) / len(threads), 2) if threads else 1
+    t["smt"] = bool(threads) and len(online) > len(threads)
+    t["n_sockets"] = len(sockets) if sockets else 1
+
+    dies = _group_by('die_cpus_list', online)
+    t["n_dies"] = len(dies) if dies else t["n_sockets"]
+
+    # --- NUMA ---
+    nodes = {}
+    for nd in sorted(glob.glob(_p('/sys/devices/system/node/node[0-9]*')),
+                     key=lambda p: int(p.rsplit('node', 1)[1])):
+        nid = int(nd.rsplit('node', 1)[1])
+        cl = _read((nd[len(SYSFS):] if SYSFS else nd) + '/cpulist')
+        s = _cpus_in(cl) & online
+        if s: nodes[nid] = s
+    t["numa_nodes"] = {str(k): _fmt(v) for k, v in sorted(nodes.items())}
+    t["n_numa"] = len(nodes)
+
+    # --- caches ---
+    t["caches"] = [{"level": c["level"], "type": c["type"], "size": c["size"],
+                    "n_domains": len(c["domains"]), "domains": c["domains"]}
+                   for c in _caches(online)]
+
+    # --- cadeia de fontes para o dominio de cache ---
+    cands = []
+    for c in reversed(t["caches"]):                    # do maior nivel para o menor
+        if c["level"] >= 2:
+            cands.append((f'L{c["level"]}', c["domains"]))
+    if len(nodes) > 1:
+        cands.append(('NUMA', [_fmt(v) for v in nodes.values()]))
+    if dies and len(dies) > t["n_sockets"]:
+        cands.append(('die', dies))
+    cl_id = _read('/sys/devices/system/cpu/cpu0/topology/cluster_id')
+    if cl_id is not None and cl_id.strip() not in ('65535', '-1', ''):
+        clusters = _group_by('cluster_cpus_list', online)
+        # so vale se for MAIS GROSSO que um core fisico (senao e o proprio SMT sibling)
+        if clusters and threads and len(clusters) < len(threads):
+            cands.append(('cluster', clusters))
+    if sockets and len(sockets) > 1:
+        cands.append(('socket', sockets))
+    if threads:
+        cands.append(('core', threads))
+
+    for src, doms in cands:
+        if not doms: continue
+        if not _partitions(doms, online):
+            t["warnings"].append(f"fonte '{src}' nao particiona as CPUs online - descartada")
+            continue
+        # Recortar pelo conjunto ONLINE: shared_cpu_list/die_cpus_list vem do hardware e
+        # inclui CPUs offline (nosmt, maxcpus=, isolcpus com hotplug). Sem isto o auto-detect
+        # devolveria um cpulist com CPU offline, e o pin-irq abortaria la na frente.
+        clipped = []
+        for d in doms:
+            s = _cpus_in(d) & online
+            if s: clipped.append(_fmt(s))
+        if len(clipped) != len(doms):
+            t["warnings"].append(f"fonte '{src}': dominios vazios apos filtrar CPUs offline")
+        t["domain_source"] = src
+        t["domains"] = clipped
+        break
+
+    if not t["domains"]:
+        t["warnings"].append("nenhuma fonte de topologia utilizavel - usando uma CPU por dominio")
+        t["domain_source"] = "cpu"
+        t["domains"] = [str(c) for c in sorted(online)]
+
+    # rotulo legivel do dominio
+    src = t["domain_source"]
+    amd = 'AMD' in (ven or '') or 'AuthenticAMD' in (ven or '')
+    if src.startswith('L') and src[1:].isdigit():
+        t["domain_label"] = 'CCX' if (amd and src == 'L3') else f'{src} domain'
+    else:
+        t["domain_label"] = {'NUMA': 'NUMA node', 'die': 'die/CCD', 'cluster': 'cluster',
+                             'socket': 'socket', 'core': 'core fisico', 'cpu': 'CPU'}.get(src, src)
+    if src in ('core', 'cpu', 'socket'):
+        t["warnings"].append(
+            f"dominio derivado de '{src}': o split NAO respeita fronteira de cache. "
+            "Se este for um EPYC/multi-CCX, passe as CPUs manualmente "
+            "(--slave0-cpus/--slave1-cpus, ou --cpus na variante single)")
+    return t
+
+def render_topology(t, extra=None):
+    """Tabela legivel da topologia detectada (usada por --print-topology)."""
+    L = []
+    L.append(f"CPU:       {t.get('model') or '?'}   [{t.get('vendor') or '?'}]")
+    L.append(f"online:    {t.get('online')}  ({t.get('n_online')} logical, "
+             f"{t.get('n_cores','?')} cores, SMT={'on' if t.get('smt') else 'off'}"
+             f" @ {t.get('threads_per_core','?')} thr/core)")
+    L.append(f"pacote:    {t.get('n_sockets','?')} socket(s), {t.get('n_dies','?')} die(s), "
+             f"{t.get('n_numa','?')} NUMA node(s)")
+    for nid, cl in (t.get('numa_nodes') or {}).items():
+        L.append(f"  NUMA {nid}:  {cl}")
+    if t.get('caches'):
+        L.append("caches:")
+        for c in t['caches']:
+            L.append(f"  L{c['level']} {c['type']:<11} {str(c['size'] or '?'):>8}"
+                     f"  -> {c['n_domains']} dominio(s)")
+    L.append(f"dominio de cache: {t.get('domain_label')}  (fonte: {t.get('domain_source')})"
+             f"  -> {len(t.get('domains') or [])} dominio(s)")
+    for i, d in enumerate(t.get('domains') or []):
+        L.append(f"  [{i}] {d}")
+    for w in (t.get('warnings') or []):
+        L.append(f"  [!] {w}")
+    if extra:
+        L.extend(extra)
+    return "\n".join(L)
+# <<< TOPOLOGY_LIB <<<
+
+iface = sys.argv[1]
+numa_filter = sys.argv[2] == "1"
+t = detect_topology()
+online = _cpus_in(t["online"])
+note = ""
+numa = -1
 
 if not online:
-    print("")
-    print("numa=-1")
-    print("note=sem CPUs online detectadas (impossível)")
+    print(json.dumps({"cpus": "", "numa": -1,
+                      "note": "nenhuma CPU online detectada", "topology": t}))
     sys.exit(0)
 
-note = ""
+chosen = online
 if numa_filter:
-    nfile = f'/sys/class/net/{iface}/device/numa_node'
-    numa = -1
-    try:
-        numa = int(open(nfile).read().strip())
-    except Exception:
-        pass
+    v = _read(f'/sys/class/net/{iface}/device/numa_node')
+    try: numa = int(v)
+    except (TypeError, ValueError): numa = -1
     if numa >= 0:
-        nc = f'/sys/devices/system/node/node{numa}/cpulist'
-        if os.path.exists(nc):
-            node = cpus_in(open(nc).read().strip())
-            inter = online & node
-            if inter:
-                print(fmt(inter))
-                print(f"numa={numa}")
-                print("note=")
-                sys.exit(0)
-            else:
-                note = f"NUMA{numa} sem CPUs online — caindo para online global"
+        node = _cpus_in(t["numa_nodes"].get(str(numa), ""))
+        inter = online & node
+        if inter:
+            chosen = inter
         else:
-            note = f"NUMA{numa} sem /sys/.../cpulist — caindo para online global"
+            note = f"NUMA{numa} sem CPUs online - usando todas as online"
+            numa = -1
     else:
-        note = "NIC reporta numa_node=-1 (NPS=1 ou indefinido) — usando todas online"
-print(fmt(online))
-print("numa=-1")
-print(f"note={note}")
+        note = "NIC reporta numa_node=-1 (NPS=1 ou indefinido) - usando todas as online"
+
+# Quantos dominios de cache o cpulist escolhido cobre (informativo).
+covered = [d for d in t["domains"] if _cpus_in(d) & chosen]
+partial = [d for d in covered if not (_cpus_in(d) <= chosen)]
+if partial:
+    note = (note + " | " if note else "") + \
+           f"{len(partial)} dominio(s) de {t['domain_label']} ficam PARCIALMENTE cobertos"
+
+res = {"cpus": _fmt(chosen), "numa": numa, "note": note,
+       "domains_covered": len(covered), "topology": t}
+if os.environ.get("TOPO_MODE") == "render":
+    extra = ["selecao para a NIC %s:" % iface,
+             "  cpus=%s" % res["cpus"],
+             "  numa da NIC=%s   dominios de %s cobertos=%s de %s" % (
+                 numa, t["domain_label"], len(covered), len(t["domains"]))]
+    if partial:
+        extra.append("  [!] %s dominio(s) ficam PARCIALMENTE cobertos: %s" % (
+            len(partial), ", ".join(partial)))
+    if note:
+        extra.append("  [!] %s" % note)
+    print(render_topology(t, extra))
+else:
+    print(json.dumps(res))
 PY
+}
+
+# --print-topology: imprime a topologia detectada (CPU, caches, NUMA, dominios de cache)
+# e o split/selecao que o auto-detect faria, depois sai. Diagnostico independente do resto do
+# fluxo: serve para conferir, num servidor novo, se o kernel expoe L3/CCX ANTES de aplicar.
+print_topology() {
+  TOPO_MODE=render topology_json
 }
 
 # ---------------- preflight ----------------
@@ -297,16 +526,26 @@ preflight() {
 
   if [[ -z "$CPUS" ]]; then
     log "auto-detect de CPUs (online ∩ NUMA-local da NIC, com --no-numa-filter pra ignorar NUMA)"
-    local detected cpus_line numa_line note_line
-    detected=$(autodetect_cpus_for_iface "$IFACE")
-    cpus_line=$(printf '%s\n' "$detected" | sed -n '1p')
-    numa_line=$(printf '%s\n' "$detected" | sed -n '2p')
-    note_line=$(printf '%s\n' "$detected" | sed -n '3p')
-    note_line="${note_line#note=}"
+    local tj
+    tj=$(topology_json) || { err "auto-detect de topologia falhou"; exit 1; }
+    local cpus_line numa_line note_line topo_line
+    cpus_line=$(TJ="$tj" python3 -c 'import json,os; print(json.loads(os.environ["TJ"])["cpus"])')
+    numa_line=$(TJ="$tj" python3 -c 'import json,os; print(json.loads(os.environ["TJ"])["numa"])')
+    note_line=$(TJ="$tj" python3 -c 'import json,os; print(json.loads(os.environ["TJ"])["note"])')
+    topo_line=$(TJ="$tj" python3 -c 'import json,os
+d=json.loads(os.environ["TJ"])["topology"]
+print("%s cores / %s logical, SMT=%s, %s socket(s), %s NUMA, %s %s(s) [%s]" % (
+  d.get("n_cores","?"), d.get("n_online","?"), "on" if d.get("smt") else "off",
+  d.get("n_sockets","?"), d.get("n_numa","?"), len(d.get("domains") or []),
+  d.get("domain_label","?"), d.get("domain_source","?")))')
     [[ -n "$cpus_line" ]] || { err "auto-detect retornou CPU list vazia"; exit 1; }
     CPUS="$cpus_line"
-    ok "CPUs auto-detectadas: ${CPUS} (${numa_line})"
+    ok "topologia: ${topo_line}"
+    ok "CPUs auto-detectadas: ${CPUS} (numa=${numa_line})"
     [[ -n "$note_line" ]] && warn "auto-detect: ${note_line}"
+    TJ="$tj" python3 -c 'import json,os
+for w in json.loads(os.environ["TJ"])["topology"].get("warnings",[]):
+    print("\033[1;33m[!]\033[0m topologia: " + w)' >&2
   fi
 
   # Sanity check ANTES do cálculo: NIC precisa ter combined channels (mlx5_core).
@@ -1366,6 +1605,7 @@ main() {
   # MESMO helper" sem depender de sed frágil sobre o heredoc:
   #   diff <(./mellanox-tune-bond.sh --print-helper) <(./mellanox-tune-single.sh --print-helper)
   if (( PRINT_HELPER )); then emit_helper; exit 0; fi
+  if (( PRINT_TOPOLOGY )); then print_topology; exit 0; fi
 
   log "mellanox-tune-single.sh — variante single-NIC, full-CPU"
   (( DRY_RUN )) && warn "DRY-RUN ATIVO: nada será escrito"
