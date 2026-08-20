@@ -17,6 +17,10 @@
 #   - CPUAffinity em xuione.service + cron.service drop-in para cores app
 #   - Tuning NIC: RDMA desativado (+blacklist persistente), ring buffer no max
 #     da NIC, coalesce adaptive RX/TX = on
+#   - sysctl: /etc/sysctl.conf e FONTE UNICA e pertence ao OPERADOR. O apply
+#     NAO reescreve o conteudo: so atualiza a data do cabecalho, roda
+#     sysctl -e -p, verifica chave a chave (arquivo vs runtime) e re-trava com
+#     chattr +i. Gerar o arquivo do template embutido e opt-in: --sysctl-init.
 #
 # TERMINOLOGIA (importante):
 #   - "CPU" neste script SEMPRE significa "core fisico" (1 dos 2 threads SMT,
@@ -127,6 +131,8 @@ VERBOSE=0
 REVERT=0
 SHOW_PLAN_ONLY=0
 ANALYZE_ONLY=0
+SYSCTL_INIT=0      # --sysctl-init: gera /etc/sysctl.conf do template embedded (modo proprio)
+SYSCTL_INIT_FORCE=0 # --sysctl-init-force: idem, sobrescrevendo arquivo que ja tem chaves (backup antes)
 
 # === Topologia detectada ===
 NUM_CCDS=0
@@ -192,9 +198,18 @@ section() { echo; printf '%s\n' "$(c_bld "=== $* ===")"; }
 # temporarios vazavam em /tmp a cada boot/re-run (inclusive copias do
 # nginx.conf). Com um diretorio unico criado no PAI, o trap limpa tudo.
 _TMPROOT=""
+# Os dois carimbos in-place (sysctl_stamp_header / nginx_stamp_block_date) NAO
+# podem usar $_TMPROOT: o tmp precisa ficar no MESMO diretorio do alvo para o
+# mv ser atomico. Sem registro, um Ctrl-C / systemctl stop / OOM na janela
+# entre criar o tmp e o mv deixava copias legiveis de /etc/sysctl.conf e do
+# nginx.conf para tras (nenhum caminho do script varre *.xuione-stamp.*).
+_STAMP_TMP=""
 cleanup_on_exit() {
   if [ -n "${_TMPROOT:-}" ]; then
     rm -rf "$_TMPROOT" 2>/dev/null || true
+  fi
+  if [ -n "${_STAMP_TMP:-}" ]; then
+    rm -f "$_STAMP_TMP" 2>/dev/null || true
   fi
   return 0
 }
@@ -225,8 +240,9 @@ ${C_BLD}O QUE FAZ${C_RST}
     ${C_CYA}app${C_RST}   =>  PHP-FPM + ffmpeg pinados nos CCDs restantes (via systemd)
     ${C_CYA}NIC${C_RST}   =>  combined queues = #CPUs rede, ring max, coalesce adaptive,
               RDMA desativado, XPS/RPS/ARFS gerenciados
-    ${C_CYA}sysctl${C_RST} =>  ${SYSCTL_FILE} ${C_YEL}REESCRITO INTEIRO${C_RST} com o template
-              embedded (buffers, backlogs, portas, BBR+fq, RFS off)
+    ${C_CYA}sysctl${C_RST} =>  ${SYSCTL_FILE} e a ${C_GRN}FONTE UNICA${C_RST} e e SEU: o apply
+              APLICA e VERIFICA o que voce escreveu (nao reescreve nada).
+              Sem arquivo / sem chaves? gere a base com ${C_BLD}--sysctl-init${C_RST}
 
   Tudo idempotente, com backup automatico e persistencia systemd (re-aplica
   no boot e em mudancas de operstate da NIC).
@@ -235,8 +251,8 @@ ${C_BLD}FLUXO RECOMENDADO${C_RST}
   ${C_GRN}1.${C_RST}  sudo ${SCRIPT_NAME} --nic IFACE --analyze        ${C_DIM}# ve topologia + sugestoes${C_RST}
   ${C_GRN}2.${C_RST}  sudo ${SCRIPT_NAME} --nic IFACE --ccds N          ${C_DIM}# revisa o plano (dry-run)${C_RST}
   ${C_GRN}3.${C_RST}  sudo ${SCRIPT_NAME} --nic IFACE --ccds N --apply  ${C_DIM}# aplica (fora de pico)${C_RST}
-  ${C_YEL}!${C_RST}   O passo 3 REESCREVE ${SYSCTL_FILE} por completo (com backup)
-      e mexe na NIC ao vivo -- leia EFEITOS COLATERAIS antes.
+  ${C_YEL}!${C_RST}   O passo 3 mexe na NIC ao vivo e RE-APLICA ${SYSCTL_FILE}
+      (sem reescrever o conteudo) -- leia EFEITOS COLATERAIS antes.
 
 ${C_BLD}USO${C_RST}
   ${SCRIPT_NAME} [--nic IFACE] [opcoes]
@@ -274,6 +290,19 @@ ${C_BLD}========================================================================
                          do backup, remove CPUAffinity, REMOVE persistencia.
                          ${C_DIM}NIC queues e ring NAO sao revertidos (tuning generico
                          seguro de manter).${C_RST}
+
+  ${C_BLD}--sysctl-init${C_RST}          Gera ${SYSCTL_FILE} a partir do template embedded
+                         (unico lugar que ainda usa o template). So aceita
+                         arquivo INEXISTENTE ou sem nenhuma chave -- o
+                         conteudo e do operador. Depois de gerar: aplica
+                         (sysctl -e -p), verifica chave a chave e trava com
+                         chattr +i. ${C_YEL}MODO EXCLUSIVO: executa e sai; nao toca
+                         NIC/IRQ/XPS/nginx/systemd.${C_RST} Rode o apply normal depois.
+                         ${C_DIM}Combine com --apply; sem ele, so mostra o plano.${C_RST}
+
+  ${C_BLD}--sysctl-init-force${C_RST}    Idem, mas SOBRESCREVE ${SYSCTL_FILE} que ja tem
+                         chaves, com backup ${C_DIM}${SYSCTL_FILE}.bak.ccdnet.<ts>${C_RST}
+                         antes. ${C_YEL}Suas customizacoes saem do arquivo.${C_RST}
 
 ${C_BLD}=============================================================================${C_RST}
 ${C_BLD}ALOCACAO DE CPUS  ${C_DIM}(--ccds VAL)${C_RST}
@@ -473,13 +502,16 @@ ${C_BLD}========================================================================
                          recarrega em reboot.
 
   ${C_BLD}${SYSCTL_FILE}${C_RST}
-                         ${C_YEL}REESCRITO INTEIRO${C_RST} com o template embedded do script
-                         (buffers, backlogs, portas, BBR+fq, RFS off).
-                         Customizacoes suas no arquivo sao PERDIDAS.
-                         Se estava com ${C_BLD}chattr +i${C_RST}: o script faz -i, reescreve
-                         e reaplica +i (edicao manual depois falha com EPERM).
-                         Backup: ${SYSCTL_FILE}.bak.ccdnet.<ts>
-                         ${C_DIM}--revert NAO restaura este arquivo.${C_RST}
+                         ${C_GRN}FONTE UNICA${C_RST} e conteudo do ${C_BLD}OPERADOR${C_RST}: o apply NAO
+                         reescreve as chaves. Ele so atualiza a linha de data
+                         do cabecalho (${C_DIM}# Aplicado por ... em ...${C_RST}), roda
+                         ${C_BLD}sysctl -e -p${C_RST}, verifica chave a chave (arquivo vs
+                         runtime) e repoe ${C_BLD}chattr +i${C_RST}.
+                         Para editar: ${C_BLD}chattr -i${C_RST}, editar, rodar o script
+                         (ele re-trava). ${C_BLD}--sysctl-init${C_RST} gera o arquivo do
+                         template quando ele nao existe / esta sem chaves
+                         (backup ${SYSCTL_FILE}.bak.ccdnet.<ts> no --force).
+                         ${C_DIM}--revert NAO mexe neste arquivo.${C_RST}
 
   ${C_BLD}${DEFAULT_NGINX_CONF}${C_RST}
                          Inserido bloco delimitado por
@@ -511,11 +543,14 @@ ${C_BLD}========================================================================
                              o ring nao estiver no maximo, e e ${C_BLD}PULADO com trafego${C_RST}
                              (use ${C_BLD}--allow-nic-reset${C_RST} em janela controlada).
   - ${C_YEL}ethtool -K feature${C_RST}       So emitido para features atualmente OFF (idempotente).
-  - ${C_YEL}${SYSCTL_FILE}${C_RST}       ${C_BLD}REESCRITO POR COMPLETO${C_RST} com o template embedded;
-                             customizacoes suas sao perdidas. Se estava com
-                             ${C_BLD}chattr +i${C_RST}, volta imutavel (edicao manual falha com
-                             EPERM ate ${C_BLD}chattr -i${C_RST}). ${C_BLD}--revert NAO desfaz.${C_RST}
+  - ${C_YEL}${SYSCTL_FILE}${C_RST}       ${C_BLD}NAO e reescrito${C_RST}: o apply so re-aplica (sysctl -e -p),
+                             verifica chave a chave e repoe ${C_BLD}chattr +i${C_RST} (edicao
+                             manual falha com EPERM ate ${C_BLD}chattr -i${C_RST}). Gerar o
+                             conteudo do template e opt-in (${C_BLD}--sysctl-init${C_RST}).
+                             ${C_BLD}--revert NAO mexe no arquivo.${C_RST}
   - nginx -s reload          ${C_BLD}SEMPRE${C_RST} executado se nginx.conf mudou. Zero-downtime.
+                             Conteudo inalterado => so a data do bloco e
+                             carimbada (comentario), ${C_BLD}sem reload${C_RST}.
   - xuione.service           ${C_BLD}NAO${C_RST} reiniciado por default (apenas daemon-reload).
                              Use ${C_BLD}--restart${C_RST} para reiniciar quando CPUAffinity mudou.
                              Sem a flag, o script avisa para reiniciar manualmente.
@@ -628,6 +663,10 @@ parse_args() {
         ALLOW_NIC_RESET=1; shift ;;
       --restart)
         RESTART_SERVICES=1; shift ;;
+      --sysctl-init)
+        SYSCTL_INIT=1; shift ;;
+      --sysctl-init-force)
+        SYSCTL_INIT=1; SYSCTL_INIT_FORCE=1; shift ;;
       --apply)
         DRY_RUN=0; shift ;;
       --plan)
@@ -648,8 +687,11 @@ parse_args() {
   done
 
   # Validacoes
-  if [ "$REVERT" -eq 1 ] || [ "$ANALYZE_ONLY" -eq 1 ]; then
-    return 0  # Revert e analyze nao precisam --ccds
+  if [ "$SYSCTL_INIT" -eq 1 ] && [ "$REVERT" -eq 1 ]; then
+    die "--sysctl-init e --revert sao mutuamente exclusivas"
+  fi
+  if [ "$REVERT" -eq 1 ] || [ "$ANALYZE_ONLY" -eq 1 ] || [ "$SYSCTL_INIT" -eq 1 ]; then
+    return 0  # Revert, analyze e --sysctl-init nao precisam --ccds nem --nic
   fi
 
   case "$CCDS_MODE" in
@@ -1348,7 +1390,7 @@ notify_impact() {
   echo "esta correto; o ring tambem e pulado se houver trafego (salvo"
   echo "${C_BLD}--allow-nic-reset${C_RST})."
   echo "${C_BLD}ethtool -K${C_RST} so e emitido para features atualmente OFF."
-  echo "${C_BLD}${SYSCTL_FILE}${C_RST} sera REESCRITO por completo (com backup)."
+  echo "${C_BLD}${SYSCTL_FILE}${C_RST} NAO e reescrito: apenas re-aplicado (sysctl -e -p) e verificado."
   echo "nginx reload e zero-downtime."
   echo
 }
@@ -1704,26 +1746,29 @@ apply_offloads() {
 }
 
 # ============================================================================
-# APPLY: sysctl /etc/sysctl.conf consolidado
+# APPLY: sysctl /etc/sysctl.conf (FONTE UNICA -- conteudo do OPERADOR)
 #
-# REESCREVE /etc/sysctl.conf inteiro com o template embedded abaixo
-# (SYSCTL_TEMPLATE). Fluxo:
-#   1) chattr -i (se imutavel)
-#   2) Backup .bak.ccdnet.<ts>
-#   3) Esvazia e escreve template novo
-#   4) sysctl -p (aplica)
-#   5) chattr +i (se estava imutavel)
+# POLITICA (decisao do operador, 2026-08-20): /etc/sysctl.conf e a FONTE UNICA
+# de verdade e pertence ao operador. O apply NAO reescreve mais o conteudo a
+# partir do template embedded. Fluxo do apply:
+#   1) nf_conntrack carregado ANTES do sysctl -p (chaves net.netfilter.*)
+#   2) atualiza SO a linha de data do cabecalho (in-place, atomico, 0644)
+#   3) sysctl -e -p  (aplica o que o operador escreveu; falha = nok, segue)
+#   4) verificacao REAL: chave a chave, arquivo vs runtime (N/M em vigor)
+#   5) chattr +i SEMPRE + symlink de boot + fonte unica (sysctl.d)
+# Sem arquivo (ou so comentarios): warn alto e a fase e PULADA -- o script
+# nao gera nada sozinho.
 #
-# O template e o tuning consolidado para XUI/IPTV em EPYC 7702P + NIC E810
-# 100G: buffers TCP, backlogs, NAPI budget, BBR+FQ, conntrack, hardening.
-# Idempotente: se conteudo + runtime ja batem, no-op.
+# O template embedded (sysctl_template) sobrou APENAS para --sysctl-init, que
+# gera o arquivo do zero quando ele nao existe / nao tem nenhuma chave.
 # ============================================================================
 readonly SYSCTL_FILE="/etc/sysctl.conf"
-readonly NETDEV_BUDGET_USECS=16000   # alvo runtime check
-readonly NETDEV_BUDGET=1200          # alvo runtime check
+readonly NETDEV_BUDGET_USECS=16000   # valor do template (--sysctl-init) + alvo no --analyze
+readonly NETDEV_BUDGET=1200          # valor do template (--sysctl-init) + alvo no --analyze
 
-# Template completo. Edits manuais sao SOBRESCRITAS pelo script -- adicione
-# customizacoes aqui se quiser persistir.
+# Template embedded: usado APENAS por --sysctl-init, como PONTO DE PARTIDA
+# para quem ainda nao tem /etc/sysctl.conf. Depois de gerado, o arquivo e do
+# OPERADOR: o apply nunca mais reescreve o conteudo (so aplica e verifica).
 sysctl_template() {
   cat <<EOF
 # === BEGIN xuione-ccd-net ===
@@ -2009,7 +2054,7 @@ enforce_single_sysctl_source() {
     done < <(grep -E '^[[:space:]]*[a-z]' "$f" 2>/dev/null | sed 's/[[:space:]]*=.*//; s/^[[:space:]]*//')
     if mv -f "$f" "${f}.disabled-by-xuione"; then
       ok "fonte unica: ${f} desativado (conflitava: ${k}=${theirs} vs ${ours} em sysctl.conf)"
-      [ -n "$lost" ] && warn "  chaves de ${base} ausentes em sysctl.conf (adicione ao template se precisar):${lost}"
+      [ -n "$lost" ] && warn "  chaves de ${base} ausentes em sysctl.conf (adicione a mao no arquivo se precisar):${lost}"
     else
       warn "nao consegui desativar ${f}; continua conflitando (vence pela ordem: ${win})"
     fi
@@ -2031,66 +2076,298 @@ restore_disabled_sysctl_d() {
   return 0
 }
 
-apply_sysctl_netdev() {
-  section "Sysctl ${SYSCTL_FILE} (reescreve consolidado)"
+# ---------------------------------------------------------------------------
+# Conta as chaves REAIS do arquivo (linhas "chave = valor"). Comentarios e
+# linhas vazias NAO contam: 0 => arquivo sem nenhuma configuracao.
+# ---------------------------------------------------------------------------
+SYSCTL_KEY_RE='^[[:space:]]*-?[a-zA-Z][a-zA-Z0-9._/-]*[[:space:]]*='
+sysctl_file_key_count() {
+  local f="${1:-$SYSCTL_FILE}" n=0
+  [ -f "$f" ] || { printf '0'; return 0; }
+  n=$(grep -cE "$SYSCTL_KEY_RE" "$f" 2>/dev/null)
+  printf '%s' "${n:-0}"
+}
 
-  if [ ! -f "$SYSCTL_FILE" ]; then
-    warn "${SYSCTL_FILE} nao existe; pulando"
+# ---------------------------------------------------------------------------
+# VERIFICACAO REAL (substitui os sentinels netdev_budget/cc/qdisc antigos):
+# compara CADA chave do arquivo com o runtime (sysctl -n). Normaliza espacos e
+# tabs -- `sysctl -n` separa vetores com TAB e o arquivo costuma usar espacos.
+# Chaves que nao existem neste kernel/modulo sao contadas a parte (sysctl -e as
+# ignora de proposito) e NAO entram como divergencia.
+# Imprime "N/M chaves do arquivo em vigor" + as divergentes com valores.
+# Retorna 0 se nada divergiu; 1 caso contrario.
+# ---------------------------------------------------------------------------
+sysctl_verify_runtime() {
+  local f="${1:-$SYSCTL_FILE}"
+  local line key want got total=0 hit=0 absent=0 diverged=""
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    want="${line#*=}"
+    key="${key//[[:space:]]/}"
+    key="${key#-}"                       # "-chave" = sysctl ignora erro dela
+    [ -n "$key" ] || continue
+    want=$(printf '%s' "$want" | tr -s ' \t' ' ' | sed 's/^ //; s/ *$//')
+    # net.core.rps_sock_flow_entries e GERENCIADA pelo script: a FASE 4 de
+    # apply_irq_xps_rps forca 0 (ARFS off) DEPOIS desta fase. Verificar contra o
+    # arquivo faria o validate divergir para sempre -- e o exit code do apply
+    # virar 1, unit systemd 'failed' a cada boot -- se o operador puser != 0.
+    if [ "$key" = "net.core.rps_sock_flow_entries" ]; then
+      if [ "$want" != "0" ]; then
+        warn "${f}: net.core.rps_sock_flow_entries = ${want}, mas o script FORCA 0 (ARFS off);"
+        warn "  remova a chave do arquivo ou aceite que o runtime fica 0 (nao e verificada)"
+      else
+        vlog "  net.core.rps_sock_flow_entries: gerenciada pelo script (ARFS off) -- nao verificada"
+      fi
+      continue
+    fi
+    if [ ! -e "/proc/sys/${key//./\/}" ]; then
+      absent=$((absent + 1))
+      continue
+    fi
+    total=$((total + 1))
+    got=$(sysctl -n "$key" 2>/dev/null | tr -s ' \t' ' ' | sed 's/^ //; s/ *$//')
+    if [ "$got" = "$want" ]; then
+      hit=$((hit + 1))
+    else
+      diverged="${diverged}${key}|${want}|${got}"$'\n'
+    fi
+  done < <(grep -E "$SYSCTL_KEY_RE" "$f" 2>/dev/null)
+
+  if [ "$total" -eq 0 ]; then
+    nok "nenhuma chave verificavel em ${f} (arquivo sem configuracao?)"
+    return 1
+  fi
+  [ "$absent" -gt 0 ] && \
+    log "  ${absent} chave(s) do arquivo nao existem neste kernel/modulo (ignoradas por sysctl -e)"
+  if [ "$hit" -eq "$total" ]; then
+    ok "${hit}/${total} chaves do arquivo em vigor no runtime"
     return 0
   fi
+  nok "${hit}/${total} chaves do arquivo em vigor no runtime; divergentes:"
+  local d_k d_w d_g
+  while IFS='|' read -r d_k d_w d_g; do
+    [ -n "$d_k" ] || continue
+    printf '      %s (arquivo=%s runtime=%s)\n' "$d_k" "$d_w" "${d_g:-?}"
+  done <<< "$diverged"
+  return 1
+}
 
-  local desired_content current_content
-  desired_content=$(sysctl_template | sed '/^# Gerado por/d')   # ignora timestamp na comparacao
-  current_content=$(sed '/^# Gerado por/d' "$SYSCTL_FILE" 2>/dev/null)
-
-  # Runtime checks (sentinels mais comuns)
-  local cur_usecs cur_budget cur_cc cur_qdisc
-  cur_usecs=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null)
-  cur_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null)
-  cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-  log "Runtime: netdev_budget=${cur_budget} usecs=${cur_usecs} cc=${cur_cc} qdisc=${cur_qdisc}"
-
-  local file_ok=0 runtime_ok=0
-  [ "$desired_content" = "$current_content" ] && file_ok=1
-  [ "$cur_usecs" = "$NETDEV_BUDGET_USECS" ] \
-    && [ "$cur_budget" = "$NETDEV_BUDGET" ] \
-    && [ "$cur_cc" = "bbr" ] \
-    && [ "$cur_qdisc" = "fq" ] && runtime_ok=1
-
-  if [ "$file_ok" = "1" ] && [ "$runtime_ok" = "1" ]; then
-    ok "${SYSCTL_FILE} ja consolidado + runtime bate (idempotente)"
-    # Mesmo sem reescrever, garante trava + persistencia no boot (alguem pode
-    # ter tirado o +i ou o symlink do sysctl.d).
-    if [ "$DRY_RUN" -eq 0 ] && ! lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-      if chattr +i "$SYSCTL_FILE" 2>/dev/null; then
-        ok "chattr +i ${SYSCTL_FILE} (re-travado)"
+# ---------------------------------------------------------------------------
+# Cabecalho: atualiza (ou insere) SO a linha de data -- o conteudo e do
+# operador e nunca e reescrito. Escrita atomica: tmp no MESMO diretorio + mv,
+# modo 0644, com chattr -i antes e +i depois (se o arquivo estava travado; a
+# fase de apply re-trava de qualquer jeito). Em dry-run: so log.
+# ---------------------------------------------------------------------------
+sysctl_stamp_header() {
+  local f="${1:-$SYSCTL_FILE}"
+  local stamp
+  stamp="# Aplicado por ${SCRIPT_NAME} em $(date '+%Y-%m-%d %H:%M:%S') (fonte unica: este arquivo; o script NAO reescreve o conteudo)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] atualizar SO a linha de data no cabecalho de ${f}:"
+    log "[dry-run]   ${stamp}"
+    return 0
+  fi
+  local was_immutable=0
+  if lsattr "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+    was_immutable=1
+    if ! chattr -i "$f" 2>/dev/null; then
+      warn "chattr -i ${f} falhou; data do cabecalho NAO atualizada"
+      return 1
+    fi
+  fi
+  local tmp="${f}.xuione-stamp.$$"
+  _STAMP_TMP="$tmp"                      # trap limpa se levarmos SIGINT/SIGTERM
+  local rc=0 keys_before lines_before
+  keys_before=$(sysctl_file_key_count "$f")
+  lines_before=$(wc -l < "$f")
+  # awk sai 9 quando NAO existe linha de data: nesse caso insere como PRIMEIRA.
+  if ! awk -v stamp="$stamp" '
+      BEGIN { stamped = 0 }
+      stamped == 0 && /^# (Gerado|Aplicado) por .* em / { print stamp; stamped = 1; next }
+      { print }
+      END { if (stamped == 0) exit 9 }
+    ' "$f" > "$tmp" 2>/dev/null; then
+    # Fallback (arquivo sem linha de data). O status PRECISA ser checado: uma
+    # escrita parcial (ENOSPC/quota/EIO/RLIMIT_FSIZE) deixa o tmp NAO-vazio
+    # porem truncado, e o mv abaixo mutilaria a fonte unica do operador.
+    if ! { printf '%s\n' "$stamp"; cat "$f"; } > "$tmp"; then
+      rm -f "$tmp"; _STAMP_TMP=""
+      warn "falha ao escrever ${tmp} (disco cheio?); ${f} intacto"
+      rc=1
+    fi
+  fi
+  # INTEGRIDADE antes do mv: nao ha mais backup deste arquivo (o conteudo e do
+  # operador e o script nao o reescreve), entao "tmp nao esta vazio" nao basta.
+  # O tmp so substitui o original se tiver TODAS as chaves e nao tiver encolhido
+  # em linhas -- o awk que INSERE a data gera lines_before+1, por isso -lt.
+  if [ "$rc" -eq 0 ]; then
+    if [ ! -s "$tmp" ] \
+       || [ "$(sysctl_file_key_count "$tmp")" -ne "$keys_before" ] \
+       || [ "$(wc -l < "$tmp")" -lt "$lines_before" ]; then
+      rm -f "$tmp"; _STAMP_TMP=""
+      warn "cabecalho novo de ${f} saiu incompleto (chaves/linhas nao batem); arquivo intacto"
+      rc=1
+    else
+      chmod 0644 "$tmp"
+      if mv -f "$tmp" "$f"; then
+        _STAMP_TMP=""
+        ok "${f}: data do cabecalho atualizada (conteudo NAO reescrito)"
       else
-        warn "chattr +i ${SYSCTL_FILE} falhou"
+        rm -f "$tmp"; _STAMP_TMP=""
+        warn "nao consegui atualizar a data do cabecalho de ${f}; arquivo intacto"
+        rc=1
       fi
     fi
-    ensure_sysctl_boot_link "$SYSCTL_FILE"
-    enforce_single_sysctl_source "$SYSCTL_FILE"
+  fi
+  [ "$was_immutable" -eq 1 ] && chattr +i "$f" 2>/dev/null
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# nf_conntrack ANTES do sysctl -p: sem o modulo, TODA chave net.netfilter.*
+# da "cannot stat" (visto em producao em 2026-08-20).
+# ---------------------------------------------------------------------------
+sysctl_ensure_conntrack() {
+  local f="${1:-$SYSCTL_FILE}"
+  grep -qE '^[[:space:]]*net\.netfilter\.nf_conntrack' "$f" 2>/dev/null || return 0
+  if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    vlog "nf_conntrack ja carregado (chaves net.netfilter.* disponiveis)"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] modprobe nf_conntrack (o arquivo tem chaves net.netfilter.*)"
+  elif modprobe nf_conntrack 2>/dev/null; then
+    ok "modulo nf_conntrack carregado (chaves net.netfilter.* disponiveis)"
+  else
+    warn "modprobe nf_conntrack falhou: chaves net.netfilter.* serao ignoradas (-e)"
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] garantir ${NF_CONNTRACK_MODLOAD} (nf_conntrack no boot, antes do systemd-sysctl)"
+  else
+    ensure_nf_conntrack_autoload
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# sysctl -e -p: aplica o arquivo do OPERADOR.
+# `-e`: ignora SO "unknown key" (chave ausente neste kernel/modulo).
+# sysctl -p aplica LINHA A LINHA e segue apos erro. Em falha: mostra so as
+# linhas de ERRO e retorna nok -- NAO ha mais restore de backup (o conteudo e
+# do operador; o script nao reescreve nada) e o apply continua (abortar aqui
+# faria o apply de boot perder IRQ pinning/ring/coalesce).
+# ---------------------------------------------------------------------------
+sysctl_apply_file() {
+  local f="${1:-$SYSCTL_FILE}"
+  local missing_keys sysctl_out sysctl_rc=0
+  missing_keys=$(sysctl_missing_keys "$f")
+  [ -n "$missing_keys" ] && warn "chaves inexistentes neste kernel (ignoradas por -e):${missing_keys}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] sysctl -e -p ${f}"
     return 0
   fi
+  sysctl_out=$(sysctl -e -p "$f" 2>&1) || sysctl_rc=$?
+  if [ "$sysctl_rc" -eq 0 ]; then
+    ok "sysctl -e -p ${f} aplicado"
+    return 0
+  fi
+  printf '%s\n' "$sysctl_out" | grep -vE '^[a-z._0-9]+ = ' | tail -20 | sed 's/^/    /' >&2
+  nok "sysctl -e -p ${f} falhou (rc=${sysctl_rc}); arquivo mantido intacto (fonte unica do operador)"
+  return 1
+}
 
-  # Detecta imutabilidade
+# ---------------------------------------------------------------------------
+# chattr +i SEMPRE: politica = arquivo travado contra edicao acidental e
+# sobrescrita pelo painel XUI. Para editar: chattr -i, editar, rodar o script
+# de novo (ele re-trava).
+# ---------------------------------------------------------------------------
+sysctl_lock_file() {
+  local f="${1:-$SYSCTL_FILE}"
+  if lsattr "$f" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+    vlog "${f} ja travado (chattr +i)"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] chattr +i ${f}"
+    return 0
+  fi
+  if chattr +i "$f" 2>/dev/null; then
+    ok "chattr +i ${f} (travado)"
+  else
+    warn "chattr +i ${f} falhou (fs sem suporte?); arquivo ficou SEM protecao"
+  fi
+  return 0
+}
+
+apply_sysctl_netdev() {
+  section "Sysctl ${SYSCTL_FILE} (fonte unica do operador; o script NAO reescreve)"
+
+  local nkeys
+  nkeys=$(sysctl_file_key_count "$SYSCTL_FILE")
+  if [ ! -f "$SYSCTL_FILE" ] || [ "$nkeys" -eq 0 ]; then
+    warn "sem configuracao em ${SYSCTL_FILE}; gere com --sysctl-init"
+    warn "  o script NAO gera sozinho -- o conteudo do arquivo e decisao do operador"
+    log  "  ex: sudo ${SCRIPT_NAME} --sysctl-init --apply    (depois edite a mao com chattr -i)"
+    log  "  fase de sysctl PULADA: o apply CONTINUA, mas o validate final vai FALHAR"
+    log  "  (exit 1 / unit systemd 'failed') ate voce rodar --sysctl-init"
+    return 0
+  fi
+  log "${SYSCTL_FILE}: ${nkeys} chaves (conteudo do operador; o script so aplica, verifica e trava)"
+
+  sysctl_ensure_conntrack "$SYSCTL_FILE"   # modulo antes do -p (chaves net.netfilter.*)
+  sysctl_stamp_header     "$SYSCTL_FILE"   # SO a linha de data do cabecalho
+  sysctl_apply_file       "$SYSCTL_FILE"   # sysctl -e -p (falha = nok e segue)
+  sysctl_verify_runtime   "$SYSCTL_FILE"   # chave a chave: arquivo vs runtime
+  sysctl_lock_file        "$SYSCTL_FILE"   # chattr +i SEMPRE
+  ensure_sysctl_boot_link "$SYSCTL_FILE"
+  enforce_single_sysctl_source "$SYSCTL_FILE"
+  return 0
+}
+
+# ============================================================================
+# --sysctl-init: UNICO caminho que ainda usa sysctl_template().
+#
+# Gera ${SYSCTL_FILE} do zero para quem ainda nao tem configuracao. RECUSA
+# sobrescrever arquivo que ja tem chaves (o conteudo e do operador), salvo
+# --sysctl-init-force, que faz backup .bak.ccdnet.<ts> antes.
+# Depois de gerar: aplica (sysctl -e -p), verifica chave a chave e trava
+# (chattr +i + symlink de boot + fonte unica). Em dry-run: so mostra o plano.
+# ============================================================================
+do_sysctl_init() {
+  section "Sysctl --sysctl-init: gerar ${SYSCTL_FILE} do template embedded"
+
+  local nkeys=0 tpl_lines tpl_keys
+  nkeys=$(sysctl_file_key_count "$SYSCTL_FILE")
+  tpl_lines=$(sysctl_template | wc -l)
+  tpl_keys=$(sysctl_template | grep -cE "$SYSCTL_KEY_RE")
+
+  if [ "$nkeys" -gt 0 ] && [ "$SYSCTL_INIT_FORCE" -eq 0 ]; then
+    echo "${C_RED}[FATAL]${C_RST} ${SYSCTL_FILE} ja tem ${nkeys} chave(s) configuradas." >&2
+    echo "        O conteudo desse arquivo e do OPERADOR (fonte unica) e nao sera" >&2
+    echo "        sobrescrito. Opcoes:" >&2
+    echo "          - editar a mao:  chattr -i ${SYSCTL_FILE} && vim ${SYSCTL_FILE}" >&2
+    echo "          - aplicar o que ja esta la:  ${SCRIPT_NAME} --nic IFACE --ccds N --apply" >&2
+    echo "          - sobrescrever mesmo assim:  --sysctl-init-force (faz backup antes)" >&2
+    exit 1
+  fi
+
   local is_immutable=0
-  if lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+  if [ -f "$SYSCTL_FILE" ] && lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
     is_immutable=1
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
     [ "$is_immutable" -eq 1 ] && log "[dry-run] chattr -i ${SYSCTL_FILE}"
-    log "[dry-run] backup ${SYSCTL_FILE} -> ${SYSCTL_FILE}.bak.ccdnet.<ts>"
-    log "[dry-run] esvaziar e reescrever ${SYSCTL_FILE} (template embedded, $(sysctl_template | wc -l) linhas)"
-    log "[dry-run] modprobe nf_conntrack + ${NF_CONNTRACK_MODLOAD} (chaves net.netfilter.* no template)"
+    [ "$nkeys" -gt 0 ] && \
+      log "[dry-run] backup ${SYSCTL_FILE} -> ${SYSCTL_FILE}.bak.ccdnet.<ts> (--sysctl-init-force)"
+    log "[dry-run] escrever ${SYSCTL_FILE} com o template embedded (${tpl_lines} linhas / ${tpl_keys} chaves)"
+    log "[dry-run] modprobe nf_conntrack + ${NF_CONNTRACK_MODLOAD} (o template tem chaves net.netfilter.*)"
     log "[dry-run] sysctl -e -p ${SYSCTL_FILE}"
-    [ "$is_immutable" -eq 1 ] && log "[dry-run] chattr +i ${SYSCTL_FILE}"
+    log "[dry-run] verificar chave a chave (arquivo vs runtime) e reportar N/M em vigor"
+    log "[dry-run] chattr +i ${SYSCTL_FILE}"
+    log "[dry-run] ${SYSCTL_BOOT_LINK} -> ../sysctl.conf + fonte unica (desativa sysctl.d conflitante)"
+    log "Depois disso o arquivo passa a ser SEU: o apply normal so aplica e verifica."
     return 0
   fi
 
-  # --- 1) chattr -i se imutavel ---
   if [ "$is_immutable" -eq 1 ]; then
     if chattr -i "$SYSCTL_FILE" 2>/dev/null; then
       log "chattr -i ${SYSCTL_FILE}"
@@ -2099,91 +2376,42 @@ apply_sysctl_netdev() {
     fi
   fi
 
-  # --- 2) Backup ---
-  local ts bak
-  ts=$(date +%Y%m%d-%H%M%S)
-  bak="${SYSCTL_FILE}.bak.ccdnet.${ts}"
-  cp -a "$SYSCTL_FILE" "$bak"
-  log "Backup: ${bak}"
-
-  # --- 3) Esvazia + reescreve via template ---
-  if ! sysctl_template > "$SYSCTL_FILE"; then
-    cp -a "$bak" "$SYSCTL_FILE"
-    [ "$is_immutable" -eq 1 ] && chattr +i "$SYSCTL_FILE" 2>/dev/null
-    die "Falha ao escrever ${SYSCTL_FILE}; backup restaurado"
-  fi
-  chmod 0644 "$SYSCTL_FILE"
-  ok "${SYSCTL_FILE} reescrito ($(wc -l < "$SYSCTL_FILE") linhas)"
-
-  # --- 3b) nf_conntrack ANTES do sysctl -p ---
-  # Sem o modulo, toda chave net.netfilter.nf_conntrack_* falha ("cannot stat")
-  # e o apply inteiro era perdido (visto em producao em 2026-08-20: modulo so
-  # foi carregado depois, por uma regra ctstate do anti-flood do XUI).
-  if grep -q '^net\.netfilter\.nf_conntrack' "$SYSCTL_FILE" 2>/dev/null; then
-    if [ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
-      if modprobe nf_conntrack 2>/dev/null; then
-        ok "modulo nf_conntrack carregado (chaves net.netfilter.* disponiveis)"
-      else
-        warn "modprobe nf_conntrack falhou: chaves net.netfilter.* serao ignoradas (-e)"
-      fi
-    fi
-    ensure_nf_conntrack_autoload
+  if [ "$nkeys" -gt 0 ]; then
+    local ts bak
+    ts=$(date +%Y%m%d-%H%M%S)
+    bak="${SYSCTL_FILE}.bak.ccdnet.${ts}"
+    cp -a "$SYSCTL_FILE" "$bak" || die "backup de ${SYSCTL_FILE} falhou; nada foi escrito"
+    ok "backup: ${bak} (--sysctl-init-force)"
   fi
 
-  # --- 4) sysctl -e -p ---
-  # sysctl -p aplica LINHA A LINHA e segue apos erro: o que veio antes da
-  # chave problematica ja esta valendo no kernel. Por isso: (a) capturamos a
-  # saida para mostrar QUAL chave falhou; (b) reaplicamos o backup para
-  # reduzir o hibrido; (c) nao usamos die -- cenario tipico e uma chave de
-  # nf_conntrack ausente (modulo nao carregado), e abortar aqui faria o apply
-  # de boot perder IRQ pinning/ring/coalesce, alem de reincidir a cada boot.
-  # `-e`: ignora SO "unknown key" (chave ausente neste kernel/modulo). Sem -e,
-  # UMA chave inexistente dava rc!=0 -> restore do backup -> apply perdido.
-  # Erros reais (EINVAL, permissao, sintaxe) continuam fatais e restauram.
-  local sysctl_out sysctl_rc=0 missing_keys
-  missing_keys=$(sysctl_missing_keys "$SYSCTL_FILE")
-  [ -n "$missing_keys" ] && warn "chaves inexistentes neste kernel (ignoradas por -e):${missing_keys}"
-  sysctl_out=$(sysctl -e -p "$SYSCTL_FILE" 2>&1) || sysctl_rc=$?
-  if [ "$sysctl_rc" -eq 0 ]; then
-    ok "sysctl -e -p ${SYSCTL_FILE} aplicado"
-  else
-    # Mostra so os ERROS: antes o tail -10 exibia as 7 chaves que passaram e
-    # escondia as que falharam.
-    printf '%s\n' "$sysctl_out" | grep -vE '^[a-z._0-9]+ = ' | tail -20 | sed 's/^/    /' >&2
-    # Restaura backup em falha de syntax/chave inexistente
-    cp -a "$bak" "$SYSCTL_FILE"
-    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || \
-      warn "runtime pode ter ficado hibrido (chaves aplicadas antes do erro) -- confira com sysctl -a"
-    [ "$is_immutable" -eq 1 ] && chattr +i "$SYSCTL_FILE" 2>/dev/null
-    nok "sysctl -p falhou; ${SYSCTL_FILE} restaurado de ${bak} (runtime parcialmente aplicado)"
-    return 1
+  # Escrita atomica: tmp no MESMO diretorio + mv, modo 0644.
+  local tmp="${SYSCTL_FILE}.xuione-init.$$"
+  if ! sysctl_template > "$tmp"; then
+    rm -f "$tmp"
+    die "Falha ao gerar ${SYSCTL_FILE} a partir do template; arquivo original intacto"
   fi
-
-  # --- 5) chattr +i SEMPRE: politica = arquivo travado contra edicao acidental
-  #        e sobrescrita por pacote; o proprio script tira e repoe a flag. ---
-  if chattr +i "$SYSCTL_FILE" 2>/dev/null; then
-    if [ "$is_immutable" -eq 1 ]; then
-      log "chattr +i ${SYSCTL_FILE} (restaurado)"
-    else
-      ok "chattr +i ${SYSCTL_FILE} (travado)"
-    fi
-  else
-    warn "chattr +i ${SYSCTL_FILE} falhou (fs sem suporte?); arquivo ficou SEM protecao"
+  chmod 0644 "$tmp"
+  if ! mv -f "$tmp" "$SYSCTL_FILE"; then
+    rm -f "$tmp"
+    die "Falha ao gravar ${SYSCTL_FILE}"
   fi
+  ok "${SYSCTL_FILE} gerado do template ($(wc -l < "$SYSCTL_FILE") linhas / ${tpl_keys} chaves)"
 
-  # --- 5b) persistencia no boot + conflitos com sysctl.d ---
+  # rc propagado para o exit code (main faz `exit $?`): gerar o arquivo e o
+  # `sysctl -e -p` falhar, ou metade das chaves nao entrar em vigor, NAO pode
+  # sair 0 -- automacao precisa detectar.
+  local rc=0
+  sysctl_ensure_conntrack "$SYSCTL_FILE"
+  sysctl_apply_file       "$SYSCTL_FILE" || rc=1
+  sysctl_verify_runtime   "$SYSCTL_FILE" || rc=1
+  sysctl_lock_file        "$SYSCTL_FILE"
   ensure_sysctl_boot_link "$SYSCTL_FILE"
   enforce_single_sysctl_source "$SYSCTL_FILE"
 
-  # --- 6) Confirma runtime ---
-  local final_usecs final_budget
-  final_usecs=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null)
-  final_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null)
-  if [ "$final_usecs" = "$NETDEV_BUDGET_USECS" ] && [ "$final_budget" = "$NETDEV_BUDGET" ]; then
-    ok "Runtime confirma: netdev_budget=${final_budget} netdev_budget_usecs=${final_usecs}"
-  else
-    nok "Runtime divergente: netdev_budget=${final_budget} netdev_budget_usecs=${final_usecs}"
-  fi
+  echo
+  log "${SYSCTL_FILE} agora e SEU: edite com 'chattr -i ${SYSCTL_FILE}' e rode o apply"
+  log "normal para re-aplicar/verificar -- o script nao reescreve mais o conteudo."
+  return "$rc"
 }
 
 # ============================================================================
@@ -2552,6 +2780,86 @@ count_matches() {
 #   6) nginx -t (em caso de falha, restaura backup); marca NGINX_CONF_CHANGED=1
 # nginx -s reload e centralizado em apply_reloads() ao final.
 # ============================================================================
+# ---------------------------------------------------------------------------
+# CARIMBO DE DATA do bloco do nginx.conf: reescreve SO a linha
+# "# Gerado por <script> em <data>" DENTRO do bloco xuione-ccd-net, in-place e
+# atomica (tmp no MESMO diretorio + mv). O arquivo pertence ao usuario xui:
+# `cp -p` semeia o tmp com dono/grupo/modo do original antes do awk reescrever
+# o conteudo nele, entao o mv preserva tudo.
+# NAO roda nginx -t (a mudanca e um comentario) e NAO marca NGINX_CONF_CHANGED:
+# nenhum reload e disparado por causa da data.
+# Usado apenas no caminho idempotente (conteudo byte-igual ao esperado).
+# ---------------------------------------------------------------------------
+nginx_stamp_block_date() {
+  local now="$1"
+  local f="$DEFAULT_NGINX_CONF"
+  local stamp="# Gerado por ${SCRIPT_NAME} em ${now}"
+
+  # O bloco ja tem linha de data? (se nao, ela entra logo apos o BEGIN)
+  local has_stamp=0
+  if awk -v b="$NGINX_BLOCK_BEGIN" -v e="$NGINX_BLOCK_END" '
+      $0 == b { inb = 1; next }
+      $0 == e { inb = 0; next }
+      inb == 1 && /^# Gerado por / { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$f" 2>/dev/null; then
+    has_stamp=1
+  fi
+
+  local tmp="${f}.xuione-stamp.$$"
+  _STAMP_TMP="$tmp"                      # trap limpa se levarmos SIGINT/SIGTERM
+  # `cp -p` cria/abre o destino ANTES de falhar: sem o rm ficava uma copia
+  # PARCIAL de nginx.conf (dono xui, modo 0550) no diretorio de config, um lixo
+  # por execucao em disco cheio -- e a mensagem "arquivo intacto" mentia.
+  if ! cp -p "$f" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; _STAMP_TMP=""
+    warn "nao consegui preparar tmp para carimbar a data do bloco em ${f}; arquivo intacto"
+    return 1
+  fi
+  if ! awk -v b="$NGINX_BLOCK_BEGIN" -v e="$NGINX_BLOCK_END" -v stamp="$stamp" -v has="$has_stamp" '
+      BEGIN { inb = 0; stamped = 0 }
+      {
+        if ($0 == b) {
+          print
+          inb = 1
+          if (has == 0 && stamped == 0) { print stamp; stamped = 1 }
+          next
+        }
+        if (inb == 1) {
+          if ($0 == e) { inb = 0; print; next }
+          if (has == 1 && stamped == 0 && /^# Gerado por /) { print stamp; stamped = 1; next }
+        }
+        print
+      }
+      END { exit(stamped ? 0 : 1) }
+    ' "$f" > "$tmp"; then
+    rm -f "$tmp"; _STAMP_TMP=""
+    warn "nao encontrei o bloco ${NGINX_BLOCK_BEGIN} para carimbar a data; nginx.conf intacto"
+    return 1
+  fi
+  # Integridade antes do mv: fora a linha de data, o tmp tem que ser BYTE-IGUAL
+  # ao original (awk com escrita parcial por ENOSPC/EIO nao pode virar um
+  # nginx.conf truncado carimbado com [OK]).
+  local lines_orig lines_tmp
+  lines_orig=$(grep -vc '^# Gerado por ' "$f" 2>/dev/null || true)
+  lines_tmp=$(grep -vc '^# Gerado por ' "$tmp" 2>/dev/null || true)
+  if [ ! -s "$tmp" ] || [ "${lines_orig:-x}" != "${lines_tmp:-y}" ] \
+     || ! cmp -s <(grep -v '^# Gerado por ' "$f") <(grep -v '^# Gerado por ' "$tmp"); then
+    rm -f "$tmp"; _STAMP_TMP=""
+    warn "carimbo de data alteraria mais que a linha de data (orig=${lines_orig} linhas, tmp=${lines_tmp}); nginx.conf intacto"
+    return 1
+  fi
+  if mv -f "$tmp" "$f"; then
+    _STAMP_TMP=""
+    ok "nginx.conf: conteudo inalterado; data do bloco atualizada para ${now}; sem reload"
+    return 0
+  fi
+  rm -f "$tmp"; _STAMP_TMP=""
+  warn "nao consegui gravar a data do bloco em ${f}; arquivo intacto"
+  return 1
+}
+
+
 apply_nginx_conf() {
   section "Aplicando nginx worker_processes + worker_cpu_affinity"
 
@@ -2657,9 +2965,19 @@ EOF
   sim_norm=$(printf '%s\n' "$sim_final" | grep -v '^# Gerado por ')
 
   if [ "$current_norm" = "$sim_norm" ]; then
-    local blk_date
+    # Conteudo byte-igual ao esperado: NAO reescreve o arquivo nem recarrega o
+    # nginx. Apenas carimba a data do bloco (comentario) para o operador saber
+    # que ESTE apply passou por aqui -- sem nginx -t, sem NGINX_CONF_CHANGED,
+    # sem reload. A data deixa de significar "ultima MUDANCA" e passa a
+    # significar "ultima vez que o apply confirmou o conteudo".
+    local now blk_date
+    now=$(date '+%Y-%m-%d %H:%M:%S')
     blk_date=$(grep -m1 '^# Gerado por ' "$DEFAULT_NGINX_CONF" 2>/dev/null | sed 's/.* em //')
-    ok "nginx.conf ja idempotente: conteudo byte-igual ao esperado, inalterado desde ${blk_date:-?} (a data no bloco marca a ultima MUDANCA, nao a ultima verificacao); sem reload"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "[dry-run] nginx.conf: conteudo inalterado (carimbo atual: ${blk_date:-?}); atualizaria SO a linha de data do bloco para ${now}; sem nginx -t, sem reload"
+      return 0
+    fi
+    nginx_stamp_block_date "$now"
     return 0
   fi
 
@@ -3714,8 +4032,16 @@ validate_all() {
     ok "irqbalance inativo"
   fi
 
-  # ---- sysctl.conf: travado (chattr +i), lido no boot, sem conflito em sysctl.d ----
-  if [ -f "$SYSCTL_FILE" ]; then
+  # ---- sysctl.conf (fonte unica): existe + tem chaves, chaves em vigor no
+  #      runtime, travado (chattr +i), lido no boot, sem conflito em sysctl.d ----
+  local sysctl_keys
+  sysctl_keys=$(sysctl_file_key_count "$SYSCTL_FILE")
+  if [ ! -f "$SYSCTL_FILE" ] || [ "$sysctl_keys" -eq 0 ]; then
+    nok "${SYSCTL_FILE} ausente ou sem nenhuma chave (gere com --sysctl-init)"
+    fails=$((fails + 1))
+  else
+    ok "${SYSCTL_FILE}: ${sysctl_keys} chaves (fonte unica; conteudo do operador)"
+    sysctl_verify_runtime "$SYSCTL_FILE" || fails=$((fails + 1))
     if lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
       ok "${SYSCTL_FILE} travado (chattr +i)"
     else
@@ -3980,7 +4306,7 @@ do_revert() {
     log "[dry-run]   - manter combined queues atual"
     log "[dry-run]   - manter NAPI defer (gro_flush_timeout + napi_defer_hard_irqs)"
     log "[dry-run]   - manter offloads ethtool (TSO/GSO/GRO/checksums/...)"
-    log "[dry-run]   - manter ${SYSCTL_FILE} (sysctl consolidado, nao reverte)"
+    log "[dry-run]   - manter ${SYSCTL_FILE} intacto (fonte unica do operador; revert nao apaga)"
     log "[dry-run]   - reativar /etc/sysctl.d/*.conf.disabled-by-xuione (fonte unica desfeita)"
     # Detecta o que MUDARIA para mostrar reloads correspondentes
     if [ -f "$DEFAULT_NGINX_CONF" ] && grep -q "^${NGINX_BLOCK_BEGIN}\$" "$DEFAULT_NGINX_CONF" 2>/dev/null; then
@@ -4379,6 +4705,21 @@ main() {
     exit $?
   fi
 
+  # --sysctl-init: modo EXCLUSIVO (gera /etc/sysctl.conf do template) e SAI.
+  # Nao toca em NIC, IRQ, XPS, nginx, CPUAffinity nem persistencia systemd --
+  # avisa quando vieram flags dessas fases, senao o apply some sem uma linha.
+  if [ "$SYSCTL_INIT" -eq 1 ]; then
+    if [ -n "$NIC" ] || [ "$CCDS_NET" -ne 0 ] || [ "$CCDS_MODE" != "numeric" ] || \
+       [ "$ANALYZE_ONLY" -eq 1 ] || [ "$SHOW_PLAN_ONLY" -eq 1 ]; then
+      warn "--sysctl-init e modo EXCLUSIVO: NIC/IRQ/XPS/nginx/systemd NAO serao tocados"
+      warn "  nesta execucao; rode o apply normal depois (--nic IFACE --ccds N --apply)"
+    fi
+    [ "$DRY_RUN" -eq 0 ] && require_root
+    acquire_lock
+    do_sysctl_init
+    exit $?
+  fi
+
   detect_topology
   require_nic
 
@@ -4409,7 +4750,7 @@ main() {
   apply_coalesce_adaptive
   apply_napi_defer        # gro_flush_timeout + napi_defer_hard_irqs
   apply_offloads          # ethtool -K TSO/GSO/GRO/checksums/etc -> on
-  apply_sysctl_netdev     # /etc/sysctl.conf consolidado (chattr -i/+i)
+  apply_sysctl_netdev     # /etc/sysctl.conf: aplica + verifica o arquivo do operador (nao reescreve)
   apply_irq_xps_rps
   apply_nginx_conf
   apply_xuione_service
