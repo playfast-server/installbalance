@@ -348,7 +348,7 @@ ${C_BLD}========================================================================
                            - /run/systemd/system/cron.service.d/*.conf
                          CPUAffinity ausente = todos os cores permitidos.
 
-  ${C_BLD}--no-systemd${C_RST}           NAO instala persistencia systemd.
+  ${C_BLD}--no-systemd${C_RST}           NAO instala persistencia systemd NOVA (se ja existe, e sincronizada).
                          ${C_DIM}Sem essa flag, sao instalados${C_RST}
                            ${PERSIST_BIN_PATH}
                            ${PERSIST_UNIT_SERVICE}
@@ -496,7 +496,7 @@ ${C_BLD}========================================================================
                          Drop-in unico com CPUAffinity para os crons do XUI.
 
   ${C_BLD}${PERSIST_BIN_PATH}${C_RST}
-                         Copia deste script (so com --no-systemd ausente).
+                         Copia canonica deste script, atualizada em todo apply.
 
   ${C_BLD}${PERSIST_UNIT_SERVICE}${C_RST}
   ${C_BLD}${PERSIST_UNIT_PATH}${C_RST}
@@ -1326,14 +1326,10 @@ preflight() {
   fi
 
   # Checa irqbalance: se ativo, reescreve /proc/irq/*/smp_affinity em segundos
-  # e desmonta todo o plano CCD-aware DEPOIS que o script ja saiu com sucesso.
-  # Apenas AVISA (nao para o servico, nao aborta): esta unit roda --apply no
-  # boot e no path-trigger; abortar aqui trocaria uma degradacao parcial por
-  # perda TOTAL do tuning (ring, coalesce, XPS, sysctl).
+  # e desmonta todo o plano CCD-aware. Aqui so INFORMA: a 1a fase do apply
+  # (disable_irqbalance) faz stop + disable antes de tocar em qualquer coisa.
   if systemctl is-active --quiet irqbalance 2>/dev/null; then
-    warn "irqbalance ATIVO: vai re-espalhar os IRQs poucos segundos apos o pinning"
-    warn "  desative com: systemctl disable --now irqbalance"
-    warn "  (ou fixe IRQBALANCE_BANNED_CPULIST em /etc/default/irqbalance)"
+    warn "irqbalance ATIVO: sera parado e desabilitado na 1a fase do apply"
   else
     ok "irqbalance inativo"
   fi
@@ -1857,6 +1853,184 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# irqbalance: PRIMEIRA fase do apply. Ativo, ele reescreve /proc/irq/*/smp_affinity
+# segundos depois do pinning e desmonta o plano CCD-aware; apenas "enabled",
+# volta no proximo boot e desfaz o que a unit aplicou. stop + disable, idempotente.
+# ---------------------------------------------------------------------------
+disable_irqbalance() {
+  section "irqbalance: stop + disable (antes de qualquer pinning)"
+  if ! systemctl cat irqbalance.service >/dev/null 2>&1; then
+    ok "irqbalance nao instalado; nada a fazer"
+    return 0
+  fi
+  local active=0 enabled=0
+  systemctl is-active  --quiet irqbalance.service 2>/dev/null && active=1
+  systemctl is-enabled --quiet irqbalance.service 2>/dev/null && enabled=1
+  if [ "$active" -eq 0 ] && [ "$enabled" -eq 0 ]; then
+    ok "irqbalance ja inativo e desabilitado (idempotente)"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    [ "$active"  -eq 1 ] && log "[dry-run] systemctl stop irqbalance.service"
+    [ "$enabled" -eq 1 ] && log "[dry-run] systemctl disable irqbalance.service"
+    return 0
+  fi
+  if [ "$active" -eq 1 ]; then
+    if systemctl stop irqbalance.service 2>/dev/null; then
+      ok "irqbalance parado"
+    else
+      nok "falha ao parar irqbalance (o pinning abaixo pode ser desfeito)"
+    fi
+  fi
+  if [ "$enabled" -eq 1 ]; then
+    if systemctl disable irqbalance.service >/dev/null 2>&1; then
+      ok "irqbalance desabilitado (nao volta no boot)"
+    else
+      nok "falha ao desabilitar irqbalance (vai voltar no proximo boot)"
+    fi
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# nf_conntrack x sysctl: as chaves net.netfilter.nf_conntrack_* do template so
+# existem com o modulo carregado. Sem ele, sysctl -p da "cannot stat" em TODAS
+# (o log de 2026-08-20 mostrava so as 3 ultimas por causa do tail), rc!=0,
+# restore do backup e apply perdido. No boot o systemd-sysctl roda DEPOIS de
+# systemd-modules-load, entao persistir o modulo em modules-load.d garante que
+# as chaves existam quando /etc/sysctl.conf for aplicado.
+# ---------------------------------------------------------------------------
+NF_CONNTRACK_MODLOAD="/etc/modules-load.d/xuione-nf_conntrack.conf"
+ensure_nf_conntrack_autoload() {
+  if grep -qsxE '[[:space:]]*nf_conntrack[[:space:]]*' /etc/modules /etc/modules-load.d/*.conf 2>/dev/null; then
+    [ -f "${NF_CONNTRACK_MODLOAD}" ] || log "nf_conntrack ja em modules-load (arquivo de terceiros); nada a fazer"
+    return 0
+  fi
+  if printf '# xuione-ccd-net: carrega nf_conntrack ANTES de systemd-sysctl, senao as chaves\n# net.netfilter.nf_conntrack_* de /etc/sysctl.conf nao existem no boot.\nnf_conntrack\n' > "${NF_CONNTRACK_MODLOAD}"; then
+    ok "criado ${NF_CONNTRACK_MODLOAD} (nf_conntrack no boot, antes do sysctl)"
+  else
+    warn "nao consegui escrever ${NF_CONNTRACK_MODLOAD}; chaves net.netfilter.* podem falhar no boot"
+  fi
+  return 0
+}
+
+# Lista (separada por espaco) as chaves de um arquivo sysctl cujo caminho em
+# /proc/sys NAO existe neste kernel. `sysctl -e` ignora essas em silencio; aqui
+# o operador fica sabendo QUAIS foram ignoradas.
+sysctl_missing_keys() {
+  local f="$1" k p out=""
+  while IFS= read -r k; do
+    [ -n "$k" ] || continue
+    p="/proc/sys/${k//./\/}"
+    [ -e "$p" ] || out="${out} ${k}"
+  done < <(awk -F'=' '/^[[:space:]]*[a-z]/{gsub(/[[:space:]]/,"",$1); print $1}' "$f" 2>/dev/null)
+  printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# sysctl no BOOT: systemd-sysctl so le /etc/sysctl.conf via o symlink
+# /etc/sysctl.d/99-sysctl.conf (convencao Debian/Ubuntu). Sem ele, tudo que
+# este script grava em /etc/sysctl.conf e ignorado no boot ate a unit rodar.
+# Tambem detecta chaves em sysctl.d que CONFLITAM com as nossas: systemd-sysctl
+# aplica em ordem lexical de basename e o ULTIMO vence -- um 99-zzz.conf
+# sobrescreveria o nosso em silencio.
+# ---------------------------------------------------------------------------
+SYSCTL_BOOT_LINK="/etc/sysctl.d/99-sysctl.conf"
+ensure_sysctl_boot_link() {
+  local target="${1:-/etc/sysctl.conf}"
+  if [ -L "$SYSCTL_BOOT_LINK" ] && [ "$(readlink -f "$SYSCTL_BOOT_LINK" 2>/dev/null)" = "$target" ]; then
+    return 0
+  fi
+  if [ -e "$SYSCTL_BOOT_LINK" ]; then
+    warn "${SYSCTL_BOOT_LINK} existe mas nao aponta para ${target}: o boot pode ignorar o arquivo"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "[dry-run] ln -s ../sysctl.conf ${SYSCTL_BOOT_LINK} (systemd-sysctl passa a ler ${target} no boot)"
+    return 0
+  fi
+  if ln -s ../sysctl.conf "$SYSCTL_BOOT_LINK" 2>/dev/null; then
+    ok "criado ${SYSCTL_BOOT_LINK} -> ../sysctl.conf (systemd-sysctl aplica ${target} no boot)"
+  else
+    warn "nao consegui criar ${SYSCTL_BOOT_LINK}; ${target} NAO sera aplicado pelo systemd-sysctl no boot"
+  fi
+  return 0
+}
+# Imprime "chave|arquivo|valor_dele|valor_nosso|vencedor" por conflito.
+sysctl_d_conflicts() {
+  local ours_file="${1:-/etc/sysctl.conf}" f base k k_re theirs ours win
+  for f in /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
+    [ -f "$f" ] || continue
+    [ -L "$f" ] && continue
+    base=$(basename "$f")
+    while IFS= read -r k; do
+      [ -n "$k" ] || continue
+      k_re=$(printf '%s' "$k" | sed 's/[.]/\\./g')
+      ours=$(grep -E "^[[:space:]]*${k_re}[[:space:]]*=" "$ours_file" 2>/dev/null | tail -1 | sed 's/.*=[[:space:]]*//' | tr -s ' \t' ' ')
+      [ -n "$ours" ] || continue
+      theirs=$(grep -E "^[[:space:]]*${k_re}[[:space:]]*=" "$f" 2>/dev/null | tail -1 | sed 's/.*=[[:space:]]*//' | tr -s ' \t' ' ')
+      [ "$ours" = "$theirs" ] && continue
+      if [ "$(printf '%s\n%s\n' "$base" "99-sysctl.conf" | sort | tail -1)" = "99-sysctl.conf" ]; then
+        win="sysctl.conf"
+      else
+        win="$base"
+      fi
+      printf '%s|%s|%s|%s|%s|%s\n' "$k" "$base" "$theirs" "$ours" "$win" "$(dirname "$f")"
+    done < <(grep -E '^[[:space:]]*[a-z]' "$f" 2>/dev/null | sed 's/[[:space:]]*=.*//; s/^[[:space:]]*//')
+  done
+}
+# Politica FONTE UNICA (decisao do operador, 2026-08-20): /etc/sysctl.conf e a
+# UNICA configuracao de sysctl administrada. Arquivos em /etc/sysctl.d que
+# conflitam com ela sao desativados (renomeados para .conf.disabled-by-xuione;
+# systemd-sysctl so le *.conf) -- reversivel no --revert. Arquivos de distro
+# em /usr/lib/sysctl.d e /run nao sao tocados: o 99-sysctl.conf ja os
+# sobrescreve pela ordem lexical, e mascara-los derrubaria defaults alheios.
+enforce_single_sysctl_source() {
+  local ours_file="${1:-/etc/sysctl.conf}" k base theirs ours win dir f lost kk n=0 done_files=" "
+  while IFS='|' read -r k base theirs ours win dir; do
+    n=$((n + 1))
+    if [ "$dir" != "/etc/sysctl.d" ]; then
+      log "sysctl: ${k}=${theirs} em ${dir}/${base} (distro) e sobrescrito por sysctl.conf (${ours}) pela ordem; sem acao"
+      continue
+    fi
+    f="${dir}/${base}"
+    case "$done_files" in *" ${f} "*) continue ;; esac
+    done_files="${done_files}${f} "
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "[dry-run] mv ${f} ${f}.disabled-by-xuione (conflita: ${k}=${theirs} vs ${ours} em sysctl.conf)"
+      continue
+    fi
+    # Chaves do arquivo que NAO existem no nosso: o operador fica sabendo o que saiu de cena.
+    lost=""
+    while IFS= read -r kk; do
+      [ -n "$kk" ] || continue
+      grep -qE "^[[:space:]]*$(printf '%s' "$kk" | sed 's/[.]/\\./g')[[:space:]]*=" "$ours_file" 2>/dev/null || lost="${lost} ${kk}"
+    done < <(grep -E '^[[:space:]]*[a-z]' "$f" 2>/dev/null | sed 's/[[:space:]]*=.*//; s/^[[:space:]]*//')
+    if mv -f "$f" "${f}.disabled-by-xuione"; then
+      ok "fonte unica: ${f} desativado (conflitava: ${k}=${theirs} vs ${ours} em sysctl.conf)"
+      [ -n "$lost" ] && warn "  chaves de ${base} ausentes em sysctl.conf (adicione ao template se precisar):${lost}"
+    else
+      warn "nao consegui desativar ${f}; continua conflitando (vence pela ordem: ${win})"
+    fi
+  done < <(sysctl_d_conflicts "$ours_file")
+  [ "$n" -eq 0 ] && log "fonte unica OK: nenhum conflito entre sysctl.d/* e ${ours_file}"
+  return 0
+}
+# --revert: reativa o que o apply desativou.
+restore_disabled_sysctl_d() {
+  local df
+  for df in /etc/sysctl.d/*.conf.disabled-by-xuione; do
+    [ -f "$df" ] || continue
+    if mv -f "$df" "${df%.disabled-by-xuione}"; then
+      ok "reativado ${df%.disabled-by-xuione} (fonte unica desfeita)"
+    else
+      warn "nao consegui reativar ${df}"
+    fi
+  done
+  return 0
+}
+
 apply_sysctl_netdev() {
   section "Sysctl ${SYSCTL_FILE} (reescreve consolidado)"
 
@@ -1886,6 +2060,17 @@ apply_sysctl_netdev() {
 
   if [ "$file_ok" = "1" ] && [ "$runtime_ok" = "1" ]; then
     ok "${SYSCTL_FILE} ja consolidado + runtime bate (idempotente)"
+    # Mesmo sem reescrever, garante trava + persistencia no boot (alguem pode
+    # ter tirado o +i ou o symlink do sysctl.d).
+    if [ "$DRY_RUN" -eq 0 ] && ! lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+      if chattr +i "$SYSCTL_FILE" 2>/dev/null; then
+        ok "chattr +i ${SYSCTL_FILE} (re-travado)"
+      else
+        warn "chattr +i ${SYSCTL_FILE} falhou"
+      fi
+    fi
+    ensure_sysctl_boot_link "$SYSCTL_FILE"
+    enforce_single_sysctl_source "$SYSCTL_FILE"
     return 0
   fi
 
@@ -1899,7 +2084,8 @@ apply_sysctl_netdev() {
     [ "$is_immutable" -eq 1 ] && log "[dry-run] chattr -i ${SYSCTL_FILE}"
     log "[dry-run] backup ${SYSCTL_FILE} -> ${SYSCTL_FILE}.bak.ccdnet.<ts>"
     log "[dry-run] esvaziar e reescrever ${SYSCTL_FILE} (template embedded, $(sysctl_template | wc -l) linhas)"
-    log "[dry-run] sysctl -p ${SYSCTL_FILE}"
+    log "[dry-run] modprobe nf_conntrack + ${NF_CONNTRACK_MODLOAD} (chaves net.netfilter.* no template)"
+    log "[dry-run] sysctl -e -p ${SYSCTL_FILE}"
     [ "$is_immutable" -eq 1 ] && log "[dry-run] chattr +i ${SYSCTL_FILE}"
     return 0
   fi
@@ -1929,19 +2115,41 @@ apply_sysctl_netdev() {
   chmod 0644 "$SYSCTL_FILE"
   ok "${SYSCTL_FILE} reescrito ($(wc -l < "$SYSCTL_FILE") linhas)"
 
-  # --- 4) sysctl -p ---
+  # --- 3b) nf_conntrack ANTES do sysctl -p ---
+  # Sem o modulo, toda chave net.netfilter.nf_conntrack_* falha ("cannot stat")
+  # e o apply inteiro era perdido (visto em producao em 2026-08-20: modulo so
+  # foi carregado depois, por uma regra ctstate do anti-flood do XUI).
+  if grep -q '^net\.netfilter\.nf_conntrack' "$SYSCTL_FILE" 2>/dev/null; then
+    if [ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+      if modprobe nf_conntrack 2>/dev/null; then
+        ok "modulo nf_conntrack carregado (chaves net.netfilter.* disponiveis)"
+      else
+        warn "modprobe nf_conntrack falhou: chaves net.netfilter.* serao ignoradas (-e)"
+      fi
+    fi
+    ensure_nf_conntrack_autoload
+  fi
+
+  # --- 4) sysctl -e -p ---
   # sysctl -p aplica LINHA A LINHA e segue apos erro: o que veio antes da
   # chave problematica ja esta valendo no kernel. Por isso: (a) capturamos a
   # saida para mostrar QUAL chave falhou; (b) reaplicamos o backup para
   # reduzir o hibrido; (c) nao usamos die -- cenario tipico e uma chave de
   # nf_conntrack ausente (modulo nao carregado), e abortar aqui faria o apply
   # de boot perder IRQ pinning/ring/coalesce, alem de reincidir a cada boot.
-  local sysctl_out sysctl_rc=0
-  sysctl_out=$(sysctl -p "$SYSCTL_FILE" 2>&1) || sysctl_rc=$?
+  # `-e`: ignora SO "unknown key" (chave ausente neste kernel/modulo). Sem -e,
+  # UMA chave inexistente dava rc!=0 -> restore do backup -> apply perdido.
+  # Erros reais (EINVAL, permissao, sintaxe) continuam fatais e restauram.
+  local sysctl_out sysctl_rc=0 missing_keys
+  missing_keys=$(sysctl_missing_keys "$SYSCTL_FILE")
+  [ -n "$missing_keys" ] && warn "chaves inexistentes neste kernel (ignoradas por -e):${missing_keys}"
+  sysctl_out=$(sysctl -e -p "$SYSCTL_FILE" 2>&1) || sysctl_rc=$?
   if [ "$sysctl_rc" -eq 0 ]; then
-    ok "sysctl -p ${SYSCTL_FILE} aplicado"
+    ok "sysctl -e -p ${SYSCTL_FILE} aplicado"
   else
-    printf '%s\n' "$sysctl_out" | tail -10 | sed 's/^/    /' >&2
+    # Mostra so os ERROS: antes o tail -10 exibia as 7 chaves que passaram e
+    # escondia as que falharam.
+    printf '%s\n' "$sysctl_out" | grep -vE '^[a-z._0-9]+ = ' | tail -20 | sed 's/^/    /' >&2
     # Restaura backup em falha de syntax/chave inexistente
     cp -a "$bak" "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || \
@@ -1951,14 +2159,21 @@ apply_sysctl_netdev() {
     return 1
   fi
 
-  # --- 5) chattr +i ---
-  if [ "$is_immutable" -eq 1 ]; then
-    if chattr +i "$SYSCTL_FILE" 2>/dev/null; then
-      log "chattr +i ${SYSCTL_FILE}"
+  # --- 5) chattr +i SEMPRE: politica = arquivo travado contra edicao acidental
+  #        e sobrescrita por pacote; o proprio script tira e repoe a flag. ---
+  if chattr +i "$SYSCTL_FILE" 2>/dev/null; then
+    if [ "$is_immutable" -eq 1 ]; then
+      log "chattr +i ${SYSCTL_FILE} (restaurado)"
     else
-      warn "chattr +i ${SYSCTL_FILE} falhou; rode manualmente"
+      ok "chattr +i ${SYSCTL_FILE} (travado)"
     fi
+  else
+    warn "chattr +i ${SYSCTL_FILE} falhou (fs sem suporte?); arquivo ficou SEM protecao"
   fi
+
+  # --- 5b) persistencia no boot + conflitos com sysctl.d ---
+  ensure_sysctl_boot_link "$SYSCTL_FILE"
+  enforce_single_sysctl_source "$SYSCTL_FILE"
 
   # --- 6) Confirma runtime ---
   local final_usecs final_budget
@@ -2442,7 +2657,9 @@ EOF
   sim_norm=$(printf '%s\n' "$sim_final" | grep -v '^# Gerado por ')
 
   if [ "$current_norm" = "$sim_norm" ]; then
-    ok "nginx.conf ja idempotente (conteudo byte-igual ao esperado); sem reload necessario"
+    local blk_date
+    blk_date=$(grep -m1 '^# Gerado por ' "$DEFAULT_NGINX_CONF" 2>/dev/null | sed 's/.* em //')
+    ok "nginx.conf ja idempotente: conteudo byte-igual ao esperado, inalterado desde ${blk_date:-?} (a data no bloco marca a ultima MUDANCA, nao a ultima verificacao); sem reload"
     return 0
   fi
 
@@ -3001,22 +3218,32 @@ EOF
 # o tuning no boot e quando NIC operstate muda.
 #
 # Cria 3 artefatos:
-#   1) /usr/local/sbin/xuione-ccd-net.sh  (copia do binario)
+#   1) /usr/local/sbin/xuione-ccd-net.sh  (COPIA canonica, refeita em todo apply;
+#      nao e symlink: o repo em /root pode ser apagado e o boot tem que seguir)
 #   2) /etc/systemd/system/xuione-ccd-net.service  (oneshot que re-aplica)
 #   3) /etc/systemd/system/xuione-ccd-net.path     (gatilho operstate)
 #
 # ExecStart e construido com as MESMAS flags usadas nesta execucao
-# (--nic, --ccds, --xps-* se != off, --no-affinity?) + --apply --no-systemd
-# (--apply executa direto, sem confirmacao interativa;
-#  --no-systemd evita loop infinito de re-instalacao).
+# (--nic, --ccds, --xps-* se != off, --no-affinity?) + --apply. SEM
+# --no-systemd: cada boot/trigger re-sincroniza a persistencia (idempotente),
+# entao fix no fonte chega ao boot sozinho. Nao ha loop: nada e escrito sem
+# comparar antes, e o proprio service nunca recebe `start` daqui.
 #
-# Pula se NO_SYSTEMD=1.
+# NO_SYSTEMD=1 so pula a INSTALACAO de persistencia nova; se ja existe, e
+# sempre sincronizada (persistencia defasada e bug, nao escolha).
 # ============================================================================
 install_persistence() {
-  if [ "$NO_SYSTEMD" -eq 1 ]; then
-    log "Persistencia systemd nao sera instalada (--no-systemd)"
+  # --no-systemd = opt-out de INSTALAR persistencia nova. Se ela JA existe, e
+  # sempre mantida em sincronia (copia canonica do script, conteudo das units,
+  # enabled): persistencia instalada e defasada e bug, nao escolha. Por isso o
+  # ExecStart gerado nao carrega mais --no-systemd: rodar sob a propria unit e
+  # seguro -- tudo e comparado antes de escrever e o proprio service nunca
+  # recebe `start` daqui (apply_reloads so da start no .path).
+  if [ "$NO_SYSTEMD" -eq 1 ] && [ ! -f "$PERSIST_UNIT_SERVICE" ] && [ ! -f "$PERSIST_UNIT_PATH" ]; then
+    log "Persistencia systemd nao sera instalada (--no-systemd e nao ha units previas)"
     return 0
   fi
+  [ "$NO_SYSTEMD" -eq 1 ] && log "--no-systemd: persistencia ja existe -> apenas sincronizando (copia/units/enable)"
 
   section "Instalando persistencia systemd (re-aplica no boot e em operstate change)"
 
@@ -3059,9 +3286,11 @@ install_persistence() {
     irq-smt) exec_flags="${exec_flags} --nginx-irq-smt" ;;
     *)       die "NGINX_MODE invalido em install_persistence: '${NGINX_MODE}'" ;;
   esac
-  # --apply executa direto (script nao tem confirmacao interativa);
-  # --no-systemd impede re-instalar a si mesmo a cada path-trigger.
-  exec_flags="${exec_flags} --apply --no-systemd"
+  # --apply executa direto (script nao tem confirmacao interativa). SEM
+  # --no-systemd: a unit re-sincroniza a propria persistencia a cada boot /
+  # path-trigger (idempotente: no-op quando nada mudou), entao um fix no fonte
+  # chega ao boot sozinho -- antes a copia em /usr/local/sbin envelhecia.
+  exec_flags="${exec_flags} --apply"
 
   local exec_start="${PERSIST_BIN_PATH} ${exec_flags}"
 
@@ -3077,8 +3306,15 @@ install_persistence() {
   # Evita daemon-reload desnecessario em re-runs do script.
   # ============================================================================
   local bin_ok=0 svc_ok=0 path_ok=0 enabled_ok=0
-  # Binario igual ao source?
-  if [ -f "$PERSIST_BIN_PATH" ] && cmp -s "$self" "$PERSIST_BIN_PATH" 2>/dev/null; then
+  # PERSIST_BIN_PATH = COPIA CANONICA real (nao symlink: o repo em /root pode
+  # ser apagado e a unit do boot precisa continuar funcionando). A copia e
+  # atualizada em TODO apply a partir do script executado: byte a byte igual
+  # -> ok; diferente -> refresh atomico com .prev. O drift de 2026-08-20 (2
+  # rodadas de fixes nunca chegaram ao boot) so existia porque --no-systemd
+  # pulava este passo -- agora persistencia existente e sempre sincronizada.
+  if [ "$self" = "$PERSIST_BIN_PATH" ]; then
+    bin_ok=1   # rodando a propria copia canonica (ex.: pela unit, ou repo apagado)
+  elif [ -f "$PERSIST_BIN_PATH" ] && [ ! -L "$PERSIST_BIN_PATH" ] && cmp -s "$self" "$PERSIST_BIN_PATH" 2>/dev/null; then
     bin_ok=1
   fi
   # Unit service ja contem ExecStart esperado E sem RemainAfterExit legado?
@@ -3103,10 +3339,13 @@ install_persistence() {
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    if [ "$self" != "$PERSIST_BIN_PATH" ]; then
-      log "[dry-run] cp ${self} ${PERSIST_BIN_PATH}"
+    if [ "$bin_ok" -eq 1 ]; then
+      log "[dry-run] ${PERSIST_BIN_PATH} ja identico a ${self} (nada a fazer)"
     else
-      log "[dry-run] binario ja em ${PERSIST_BIN_PATH} (nao copiaria)"
+      [ -L "$PERSIST_BIN_PATH" ] && log "[dry-run] rm symlink ${PERSIST_BIN_PATH} (modelo antigo)"
+      [ -f "$PERSIST_BIN_PATH" ] && [ ! -L "$PERSIST_BIN_PATH" ] \
+        && log "[dry-run] cp ${PERSIST_BIN_PATH} ${PERSIST_BIN_PATH}.prev (versao anterior)"
+      log "[dry-run] install -m 0755 ${self} ${PERSIST_BIN_PATH} (atomico via .tmp + mv)"
     fi
     log "[dry-run] criaria ${PERSIST_UNIT_SERVICE}"
     log "[dry-run] criaria ${PERSIST_UNIT_PATH}"
@@ -3121,14 +3360,30 @@ install_persistence() {
   if ! mkdir -p "$bin_dir"; then
     die "Nao consegui criar diretorio ${bin_dir} para instalar binario."
   fi
-  if [ "$self" != "$PERSIST_BIN_PATH" ]; then
-    if ! cp -f "$self" "$PERSIST_BIN_PATH"; then
-      die "Falha ao copiar ${self} -> ${PERSIST_BIN_PATH} (disco cheio? permissoes?)"
-    fi
-    chmod 0755 "$PERSIST_BIN_PATH" || die "chmod 0755 ${PERSIST_BIN_PATH} falhou"
-    ok "Binario copiado: ${self} -> ${PERSIST_BIN_PATH}"
+  if [ "$bin_ok" -eq 1 ]; then
+    ok "${PERSIST_BIN_PATH} ja identico ao script executado"
   else
-    ok "Binario ja em ${PERSIST_BIN_PATH} (rodando dali)"
+    # Symlink do modelo intermediario (nunca chegou a producao, mas por via das duvidas)
+    [ -L "$PERSIST_BIN_PATH" ] && rm -f "$PERSIST_BIN_PATH"
+    # Aviso de downgrade: o script executado e a fonte de verdade (o operador
+    # escolheu rodar ESTE), mas se a copia instalada for mais nova, avisa alto.
+    if [ -f "$PERSIST_BIN_PATH" ]; then
+      local inst_ver
+      inst_ver=$(grep -m1 -E '^VERSION=' "$PERSIST_BIN_PATH" 2>/dev/null | cut -d'"' -f2)
+      if [ -n "$inst_ver" ] && [ "$inst_ver" != "$VERSION" ] \
+         && [ "$(printf '%s\n%s\n' "$inst_ver" "$VERSION" | sort -V | tail -1)" = "$inst_ver" ]; then
+        warn "DOWNGRADE: copia instalada e v${inst_ver}, este script e v${VERSION} -- instalando mesmo assim (.prev guarda a anterior)"
+      fi
+      cp -af "$PERSIST_BIN_PATH" "${PERSIST_BIN_PATH}.prev" 2>/dev/null \
+        || warn "nao consegui guardar ${PERSIST_BIN_PATH}.prev"
+    fi
+    # Escrita atomica: um path-trigger no meio da copia nunca ve script truncado.
+    if install -m 0755 "$self" "${PERSIST_BIN_PATH}.tmp" && mv -f "${PERSIST_BIN_PATH}.tmp" "$PERSIST_BIN_PATH"; then
+      ok "Copia canonica atualizada: ${self} -> ${PERSIST_BIN_PATH} (v${VERSION}; anterior em .prev)"
+    else
+      rm -f "${PERSIST_BIN_PATH}.tmp"
+      die "Falha ao instalar ${self} -> ${PERSIST_BIN_PATH} (disco cheio? permissoes?)"
+    fi
   fi
 
   # 2) Cria xuione-ccd-net.service
@@ -3459,6 +3714,35 @@ validate_all() {
     ok "irqbalance inativo"
   fi
 
+  # ---- sysctl.conf: travado (chattr +i), lido no boot, sem conflito em sysctl.d ----
+  if [ -f "$SYSCTL_FILE" ]; then
+    if lsattr "$SYSCTL_FILE" 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+      ok "${SYSCTL_FILE} travado (chattr +i)"
+    else
+      nok "${SYSCTL_FILE} SEM chattr +i (apply re-trava)"
+      fails=$((fails + 1))
+    fi
+    if [ -L "$SYSCTL_BOOT_LINK" ] && [ "$(readlink -f "$SYSCTL_BOOT_LINK" 2>/dev/null)" = "$SYSCTL_FILE" ]; then
+      ok "boot: ${SYSCTL_BOOT_LINK} -> ${SYSCTL_FILE} (systemd-sysctl aplica no boot)"
+    else
+      nok "boot: ${SYSCTL_BOOT_LINK} ausente/errado -- ${SYSCTL_FILE} NAO e aplicado no boot (apply cria)"
+      fails=$((fails + 1))
+    fi
+    # Fonte unica: conflito em /etc/sysctl.d = FAIL (apply desativa o arquivo);
+    # /usr/lib e /run (distro) sao sobrescritos pela ordem -- informativo.
+    local cf_k cf_base cf_theirs cf_ours cf_dir cf_n=0
+    while IFS='|' read -r cf_k cf_base cf_theirs cf_ours _ cf_dir; do
+      if [ "$cf_dir" = "/etc/sysctl.d" ]; then
+        cf_n=$((cf_n + 1))
+        nok "fonte unica violada: ${cf_k}=${cf_theirs} em ${cf_dir}/${cf_base} vs ${cf_ours} em sysctl.conf (apply desativa)"
+        fails=$((fails + 1))
+      else
+        ok "sysctl: ${cf_k}=${cf_theirs} em ${cf_dir}/${cf_base} (distro) sobrescrito por sysctl.conf (${cf_ours})"
+      fi
+    done < <(sysctl_d_conflicts "$SYSCTL_FILE")
+    [ "$cf_n" -eq 0 ] && ok "fonte unica: nenhum conflito em /etc/sysctl.d com ${SYSCTL_FILE}"
+  fi
+
   # ---- XPS: valida TODAS as tx-* queues ----
   # Considera "zerado" se valor for "0" OU all-zeros hex (formato cpumask)
   local xps_with_mask=0 xps_zeroed=0
@@ -3697,6 +3981,7 @@ do_revert() {
     log "[dry-run]   - manter NAPI defer (gro_flush_timeout + napi_defer_hard_irqs)"
     log "[dry-run]   - manter offloads ethtool (TSO/GSO/GRO/checksums/...)"
     log "[dry-run]   - manter ${SYSCTL_FILE} (sysctl consolidado, nao reverte)"
+    log "[dry-run]   - reativar /etc/sysctl.d/*.conf.disabled-by-xuione (fonte unica desfeita)"
     # Detecta o que MUDARIA para mostrar reloads correspondentes
     if [ -f "$DEFAULT_NGINX_CONF" ] && grep -q "^${NGINX_BLOCK_BEGIN}\$" "$DEFAULT_NGINX_CONF" 2>/dev/null; then
       log "[dry-run]   - remover bloco ccd-net do nginx.conf"
@@ -3788,15 +4073,20 @@ do_revert() {
     PERSISTENCE_CHANGED=2  # 2 = removida (apply_reloads NAO faz start path)
     ok "Persistencia systemd removida (units desabilitados)"
   fi
-  if [ -f "$PERSIST_BIN_PATH" ]; then
-    rm -f "$PERSIST_BIN_PATH"
-    ok "Binario persistencia removido: ${PERSIST_BIN_PATH}"
+  if [ -e "$PERSIST_BIN_PATH" ] || [ -L "$PERSIST_BIN_PATH" ]; then
+    rm -f "$PERSIST_BIN_PATH" "${PERSIST_BIN_PATH}.prev"
+    ok "Copia canonica de persistencia removida: ${PERSIST_BIN_PATH} (+ .prev)"
   fi
 
   # Consolida reloads (daemon-reload + restart cron + nginx reload)
   apply_reloads
 
   echo
+  # Fonte unica desfeita: reativa os sysctl.d que o apply desativou
+  # (sysctl.conf em si e mantido, como documentado acima).
+  section "REVERT: reativando /etc/sysctl.d desativados pela fonte unica"
+  restore_disabled_sysctl_d
+
   printf '%s\n' "$(c_grn '*** REVERT CONCLUIDO ***')"
   log "Nota: ethtool combined queues NAO foi alterado (use 'ethtool -L ${NIC} combined N' manualmente se quiser)"
 }
@@ -4112,6 +4402,7 @@ main() {
     notify_impact
   fi
 
+  disable_irqbalance      # PRIMEIRO: stop + disable, senao desfaz o pinning abaixo
   apply_rdma_off
   apply_ring_size_max
   apply_nic_queues
