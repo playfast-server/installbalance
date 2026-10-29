@@ -27,6 +27,8 @@
 #   ./intel-xl710-tune-bond.sh --no-control-pin          # NÃO pina as IRQs de controle (misc/fdir/ahci/PCIe/...)
 #   ./intel-xl710-tune-bond.sh --nginx-affinity          # + worker_cpu_affinity auto no nginx do XUI (reload gracioso)
 #   ./intel-xl710-tune-bond.sh --nginx-conf PATH         # conf do nginx (default /home/xui/bin/nginx/conf/nginx.conf)
+#   ./intel-xl710-tune-bond.sh --smt-split               # dataplane por core: fila N numa thread do core, o irmão
+#                                                        #   SMT fica para nginx/PHP/ffmpeg (ver "SMT split" abaixo)
 #   ./intel-xl710-tune-bond.sh --allow-single-link       # aplica mesmo com só 1 link ativo (bond com 1 slave
 #                                                        #   ou placa única): HAVERÁ queda nos resets
 #   ./intel-xl710-tune-bond.sh --no-systemd              # aplica em runtime, não persiste
@@ -73,6 +75,18 @@
 #      PME/hotplug, ...) pinadas nas --control-cpus (default ON)
 #   9. --nginx-affinity: worker_cpu_affinity auto no nginx do XUI (worker N -> CPU N)
 #  10. Systemd unit baked com o MESMO flag-set (sobrevive a reboot).
+#
+# SMT split (--smt-split): cache quente, pacote e aplicação no MESMO core físico.
+#   - Do cpulist de cada slave (auto ou --cpus) sai UMA thread por core para as filas (a menor
+#     do core); os irmãos SMT (thread_siblings_list) viram as CPUs de aplicação. Nunca assume
+#     numeração: num Xeon 2x16c o irmão do CPU 1 é o 33, num EPYC 64c é o 65.
+#   - filas = nº de cores (limitado ao max combined); IRQ da fila N -> thread A do core N.
+#   - XPS da fila N = core inteiro (thread A + irmão): o worker no irmão transmite pela fila N.
+#   - ATR ligado (default neste modo): o Flow Director vê o TX da conexão na fila N e programa
+#     o RX dela para a fila N -> softirq na thread A, o worker na thread B: mesmo L1/L2.
+#   - --nginx-affinity: worker_processes = nº de irmãos, worker K preso no irmão do core K
+#     (worker_cpu_affinity explícito; o worker_processes original fica comentado e volta no
+#     rollback). PHP-FPM/ffmpeg: prenda nos mesmos irmãos (o script imprime o cpulist).
 #
 # Auto-detect (sem flags --slave*-cpus / --queues):
 #   1. Lê CCXs únicos via /sys/.../cache/index3/shared_cpu_list.
@@ -138,7 +152,9 @@ APPLY_CONTROL_PIN=1  # default ON; --no-control-pin desabilita
 CONTROL_CPUS=""      # --control-cpus; vazio = CPU0 + irmãos SMT (thread_siblings_list)
 APPLY_NGINX=0        # --nginx-affinity
 NGINX_CONF="/home/xui/bin/nginx/conf/nginx.conf"
-APPLY_RING_MAX=1     # default ON; --no-ring desabilita
+APPLY_SMT_SPLIT=0    # --smt-split
+APP_CPUS=""          # --smt-split: irmãos SMT das CPUs de fila, na ordem das filas
+APPLY_RING_MAX=1    # default ON; --no-ring desabilita
 APPLY_COALESCE=1     # default ON; --no-coalesce desabilita
 APPLY_OFFLOADS=1     # default ON; --no-offloads desabilita
 APPLY_QDISC=1        # default ON; --no-qdisc desabilita (regenera qdisc das tx queues)
@@ -227,7 +243,8 @@ while [[ $# -gt 0 ]]; do
     --no-control-pin)       APPLY_CONTROL_PIN=0 ;;
     --nginx-affinity)       APPLY_NGINX=1 ;;
     --nginx-conf)           need_arg "$1" "${2-}"; NGINX_CONF="$2"; shift ;;
-    --no-coalesce)          APPLY_COALESCE=0 ;;
+    --smt-split)            APPLY_SMT_SPLIT=1 ;;
+    --no-coalesce)         APPLY_COALESCE=0 ;;
     --no-offloads)          APPLY_OFFLOADS=0 ;;
     --no-qdisc)             APPLY_QDISC=0 ;;
     --print-helper)         PRINT_HELPER=1 ;;
@@ -253,6 +270,11 @@ CONTROL_CPUS=$(normalize_cpulist --control-cpus "$CONTROL_CPUS")
 [[ -z "$NIC" || "$NIC" =~ ^[A-Za-z0-9._-]+$ ]] || { err "--nic '${NIC}': nome de interface inválido"; exit 1; }
 [[ -z "$NIC" || -d "/sys/class/net/$NIC" ]] || { err "--nic: interface '${NIC}' não existe"; exit 1; }
 (( ! BOND_EXPLICIT )) || [[ -z "$NIC" ]] || { err "--bond e --nic são exclusivos"; exit 1; }
+# SMT split depende do ATR para trazer o RX de volta à fila do core do worker.
+if (( APPLY_SMT_SPLIT )); then
+  [[ -n "$ATR_STATE" ]] || ATR_STATE=on
+  (( APPLY_XPS )) || { err "--smt-split precisa de XPS (não combine com --no-xps)"; exit 1; }
+fi
 
 # ---------------- helpers de máscara ----------------
 
@@ -853,6 +875,8 @@ PY
     log "topologia 100% via flags de cpulist (auto-detect skipado)"
   fi
 
+  (( APPLY_SMT_SPLIT )) && apply_smt_split
+
   # Resolve QUEUES por interface:
   #   - --queues N: N em todas
   #   - senão: min(n_cpus da interface, max-combined da interface)
@@ -876,6 +900,66 @@ PY
   if [[ -n "$QUEUES" ]]; then ok "queues forçado via --queues: ${msg}"; else ok "queues calculado: ${msg}"; fi
 
   for i in "${!IFACES[@]}"; do validate_numa_for_slave "${IFACES[i]}" "$(cpus_of "$i")"; done
+}
+
+# "irq|app" para um cpulist: uma thread por core (a menor do cpulist naquele core) para as
+# filas, e o(s) irmão(s) SMT online desse core para a aplicação, na MESMA ordem — irmão K é o
+# do core da fila K. Os irmãos vêm do thread_siblings_list, mesmo fora do cpulist (--cpus 0-15
+# põe as filas em 0-15 e a aplicação nos irmãos). Ordem preservada: nada de ranges.
+smt_split_cpulist() {
+  python3 - "$1" <<'PY'
+import sys
+def cpus_in(spec):
+    s = []
+    for t in spec.strip().split(','):
+        if not t: continue
+        a, _, b = t.partition('-')
+        s += range(int(a), int(b or a) + 1)
+    return s
+online = set(cpus_in(open('/sys/devices/system/cpu/online').read()))
+irq, app, seen = [], [], set()
+for c in sorted(set(cpus_in(sys.argv[1]))):
+    sib = [x for x in cpus_in(open(f'/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list').read())
+           if x in online]
+    core = min(sib)
+    if core in seen: continue
+    seen.add(core)
+    others = [x for x in sib if x != c]
+    if not others:
+        sys.exit(f"CPU {c} não tem irmão SMT online (SMT desligado/nosmt?) — --smt-split não se aplica")
+    irq.append(c); app += others
+print(','.join(map(str, irq)) + '|' + ','.join(map(str, app)))
+PY
+}
+
+apply_smt_split() {
+  local i split irq app all_app=""
+  log "SMT split: uma thread por core para as filas, o irmão SMT para nginx/PHP/ffmpeg"
+  for i in "${!IFACES[@]}"; do
+    split=$(smt_split_cpulist "$(cpus_of "$i")") || { err "${IFACES[i]}: smt split falhou"; exit 1; }
+    irq="${split%%|*}"; app="${split#*|}"
+    if (( i == 0 )); then SLAVE0_CPUS="$irq"; else SLAVE1_CPUS="$irq"; fi
+    ok "  ${IFACES[i]}: filas -> CPUs ${irq}"
+    ok "  ${IFACES[i]}: irmãos -> CPUs ${app}"
+    all_app+="${all_app:+,}${app}"
+  done
+  # Bond: os dois slaves podem cair nos mesmos cores; dedup mantendo a ordem.
+  APP_CPUS=$(awk -v RS=, '!s[$0+0]++ {printf "%s%s", (n++ ? "," : ""), $0+0}' <<< "$all_app")
+  ok "  CPUs de aplicação (nginx/PHP-FPM/ffmpeg): ${APP_CPUS}"
+  if [[ "$ATR_STATE" != on ]]; then
+    warn "--smt-split com --atr ${ATR_STATE}: sem ATR o RX volta ao hash RSS e cai em qualquer core"
+  fi
+  if (( APPLY_CONTROL_PIN )); then
+    local ctl_overlap
+    ctl_overlap=$(python3 -c 'import sys
+def c(s):
+    r=set()
+    for t in s.split(","):
+        a,_,b=t.partition("-"); r|=set(range(int(a),int(b or a)+1))
+    return r
+print(",".join(map(str,sorted(c(sys.argv[1]) & (c(sys.argv[2])|c(sys.argv[3]))))))' "$CONTROL_CPUS" "$SLAVE0_CPUS,${SLAVE1_CPUS:-$SLAVE0_CPUS}" "$APP_CPUS")
+    [[ -z "$ctl_overlap" ]] || warn "IRQs de controle (${CONTROL_CPUS}) dividem as CPUs ${ctl_overlap} com fila/aplicação — tire o core das filas com --cpus se pesar"
+  fi
 }
 
 # Avisa (sem abortar) se cpulist tem CPUs fora do NUMA da NIC.
@@ -1171,6 +1255,11 @@ apply_control_pin() {
 # Com worker_processes auto (= nproc) cada CPU fica com um worker.
 apply_nginx_affinity() {
   (( APPLY_NGINX )) || return 0
+  if (( APPLY_SMT_SPLIT )); then
+    log "nginx: worker_processes $(count_cpus_in_list "$APP_CPUS") + worker_cpu_affinity nos irmãos SMT (${APP_CPUS})"
+    run "${HELPER_PATH} nginx-affinity ${NGINX_CONF} on ${APP_CPUS}"
+    return
+  fi
   # CPUs distintas usadas pelas IRQs (no bond os dois slaves podem dividir o mesmo NUMA).
   local wp ncpu_nic ncpu_all i all=""
   for i in "${!IFACES[@]}"; do all+="${all:+,}$(cpus_of "$i")"; done
@@ -1202,8 +1291,13 @@ apply_pinning() {
 # entre IRQ e steering. XPS é default ON no i40e; RPS/RFS só com flag.
 
 apply_xps_per_irq() {
-  log "XPS per-queue espelhando IRQ (tx-N -> CPU do IRQ TxRx-N)"
-  for s in "${IFACES[@]}"; do run "${HELPER_PATH} mirror-xps ${s}"; done
+  if (( APPLY_SMT_SPLIT )); then
+    log "XPS per-queue no core inteiro (tx-N -> CPU do IRQ TxRx-N + irmão SMT)"
+    for s in "${IFACES[@]}"; do run "${HELPER_PATH} mirror-xps ${s} core"; done
+  else
+    log "XPS per-queue espelhando IRQ (tx-N -> CPU do IRQ TxRx-N)"
+    for s in "${IFACES[@]}"; do run "${HELPER_PATH} mirror-xps ${s}"; done
+  fi
   ok "XPS aplicado"
 }
 
@@ -1241,7 +1335,7 @@ apply_arfs_all() {
 # a mesma sequência (sem divergência de lógica entre os dois caminhos).
 # Bumpar quando o conteudo do heredoc abaixo mudar; o grep casa por essa tag.
 # Helper PRÓPRIO do i40e (caminho diferente do helper Mellanox), não é compartilhado.
-HELPER_VERSION=2
+HELPER_VERSION=3
 
 # Emite o helper embutido em stdout. Separado de deploy_helper() para que --print-helper
 # produza exatamente o mesmo conteúdo que é instalado, sem efeito colateral. Escreve em
@@ -1249,14 +1343,15 @@ HELPER_VERSION=2
 emit_helper() {
   cat <<'HELPER_EOF'
 #!/usr/bin/env bash
-# HELPER_VERSION=2 (i40e)
+# HELPER_VERSION=3 (i40e)
 # Helper do intel-xl710-tune-bond.sh (Intel XL710/X710, driver i40e).
 # Subcomandos:
 #   cleanup <iface>            Zera smp_affinity dos IRQs i40e-<iface>-TxRx-* da iface,
 #                              rps_cpus, xps_cpus, rps_flow_cnt (ntuple NÃO é tocado:
 #                              no i40e alterná-lo faz reset da PF).
 #   cleanup-global             sysctl net.core.rps_sock_flow_entries=0.
-#   mirror-xps <iface>         xps_cpus[tx-N] = smp_affinity[i40e-<iface>-TxRx-N].
+#   mirror-xps <iface> [core]  xps_cpus[tx-N] = smp_affinity[i40e-<iface>-TxRx-N]; com 'core',
+#                              soma os irmãos SMT dessa CPU (thread_siblings_list).
 #   mirror-rps <iface>         rps_cpus[rx-N] = smp_affinity[i40e-<iface>-TxRx-N].
 #   arfs <iface> [total]       RFS por software: rps_flow_cnt = total/n_rx_queues por fila
 #                              (default total 32768; ver Documentation/networking/scaling.rst).
@@ -1264,9 +1359,12 @@ emit_helper() {
 #   pin-control <cpulist>      Pina toda IRQ que não é fila de dados de NIC no cpulist.
 #   unpin-control              Devolve essas IRQs ao /proc/irq/default_smp_affinity.
 #   show-control               Lista as IRQs de controle e a afinidade atual.
-#   nginx-affinity <conf> <on|off>
+#   nginx-affinity <conf> <on|off> [cpulist]
 #                              Insere/remove 'worker_cpu_affinity auto;' (marcado), com
-#                              backup, nginx -t e reload gracioso (HUP no master).
+#                              backup, nginx -t e reload gracioso (HUP no master). Com
+#                              cpulist: worker_processes = nº de CPUs e worker K preso na
+#                              K-ésima CPU (ordem do cpulist); o worker_processes original
+#                              fica comentado e volta no 'off'. Sem mudança = sem reload.
 #   arfs-global [entries]      sysctl net.core.rps_sock_flow_entries (default 32768).
 #   show-irq <iface>           Lista IRQ -> smp_affinity/cpu da NIC (snapshot; equivale
 #                              ao show_irq_affinity.sh do mlnx-tools).
@@ -1643,6 +1741,8 @@ unpin_control() {
 # Binário deduzido do layout do XUI: <prefix>/conf/nginx.conf -> <prefix>/sbin/<basename prefix>
 # (/home/xui/bin/nginx -> sbin/nginx, /home/xui/bin/nginx_rtmp -> sbin/nginx_rtmp).
 NGX_MARK="# xui-lb-i40e: worker_cpu_affinity"
+# Prefixo do worker_processes original enquanto o --smt-split manda no número de workers.
+NGX_ORIG="#xui-lb-i40e-orig# "
 nginx_bin_for_conf() {
   local prefix; prefix=$(dirname "$(dirname "$1")")
   echo "${prefix}/sbin/$(basename "$prefix")"
@@ -1659,32 +1759,54 @@ nginx_reload() {
   kill -HUP "$pid" && echo "nginx-affinity: reload gracioso enviado ao master ${pid}"
 }
 nginx_affinity() {
-  local conf="$1" mode="${2:-on}" bin bak
+  local conf="$1" mode="${2:-on}" cpus="${3:-}" bin bak base want masks n
   [[ -f "$conf" ]] || { echo "nginx-affinity: ${conf} não existe — pulando" >&2; return 0; }
   bin=$(nginx_bin_for_conf "$conf")
   [[ -x "$bin" ]] || { echo "nginx-affinity: binário ${bin} não encontrado — pulando" >&2; return 0; }
-  bak="${conf}.pre-affinity-$(date +%Y%m%d-%H%M%S)"
-  if [[ "$mode" == on ]]; then
-    if grep -qF -- "$NGX_MARK" "$conf"; then
-      echo "nginx-affinity: ${conf} já tem worker_cpu_affinity (nosso)"; return 0
-    fi
-    if grep -qE '^[[:space:]]*worker_cpu_affinity' "$conf"; then
+  [[ "$mode" == on || "$mode" == off ]] || { echo "nginx-affinity: modo deve ser on|off" >&2; return 1; }
+  # base = conf sem nada nosso: linhas marcadas fora, worker_processes original descomentado.
+  # O alvo é sempre derivado da base, então trocar o cpulist (ou on <-> off) reescreve limpo.
+  base=$(awk -v mark="$NGX_MARK" -v orig="$NGX_ORIG" '
+    index($0, mark) { next }
+    index($0, orig) == 1 { print substr($0, length(orig) + 1); next }
+    { print }' "$conf")
+  if [[ "$mode" == off ]]; then
+    want="$base"
+  else
+    if grep -qE '^[[:space:]]*worker_cpu_affinity' <<< "$base"; then
       echo "nginx-affinity: ${conf} já tem worker_cpu_affinity próprio — não alterando" >&2; return 0
     fi
-    grep -qE '^[[:space:]]*worker_processes' "$conf" || {
+    grep -qE '^[[:space:]]*worker_processes' <<< "$base" || {
       echo "nginx-affinity: ${conf} sem worker_processes — não alterando" >&2; return 0; }
-    cp -a "$conf" "$bak"
-    awk -v mark="$NGX_MARK" '
-      { print }
-      !done && /^[[:space:]]*worker_processes/ { print "worker_cpu_affinity auto;  " mark; done = 1 }
-    ' "$bak" > "$conf"
-  elif [[ "$mode" == off ]]; then
-    grep -qF -- "$NGX_MARK" "$conf" || { echo "nginx-affinity: ${conf} sem a linha do script — nada a remover"; return 0; }
-    cp -a "$conf" "$bak"
-    grep -vF -- "$NGX_MARK" "$bak" > "$conf"
-  else
-    echo "nginx-affinity: modo deve ser on|off" >&2; return 1
+    if [[ -z "$cpus" ]]; then
+      want=$(awk -v mark="$NGX_MARK" '
+        { print }
+        !done && /^[[:space:]]*worker_processes/ { print "worker_cpu_affinity auto;  " mark; done = 1 }
+      ' <<< "$base")
+    else
+      # Uma máscara binária por worker (bit mais à direita = CPU 0), na ordem do cpulist.
+      masks=$(expand_cpulist "$cpus" | python3 -c 'import sys
+c=[int(x) for x in sys.stdin.read().split()]
+w=max(c)+1
+print(" ".join(format(1<<x,"b").zfill(w) for x in c))') || { echo "nginx-affinity: cpulist inválido '${cpus}'" >&2; return 1; }
+      n=$(wc -w <<< "$masks")
+      want=$(awk -v mark="$NGX_MARK" -v orig="$NGX_ORIG" -v n="$n" -v masks="$masks" '
+        !done && /^[[:space:]]*worker_processes/ {
+          print orig $0
+          print "worker_processes " n ";  " mark
+          print "worker_cpu_affinity " masks ";  " mark
+          done = 1; next
+        }
+        { print }' <<< "$base")
+    fi
   fi
+  if [[ "$want" == "$(cat "$conf")" ]]; then
+    echo "nginx-affinity: ${conf} já está no estado pedido (${mode}${cpus:+ ${cpus}}) — sem reload"; return 0
+  fi
+  bak="${conf}.pre-affinity-$(date +%Y%m%d-%H%M%S)"
+  cp -a "$conf" "$bak"
+  # $(...) come o \n final: devolve só se o original tinha (o conf do XUI termina sem).
+  if [[ -n "$(tail -c1 "$bak")" ]]; then printf '%s' "$want"; else printf '%s\n' "$want"; fi > "$conf"
   # cp -a + redirect preserva dono/permissão do arquivo original (o '>' reusa o inode).
   if ! "$bin" -t -c "$conf" >/dev/null 2>&1; then
     echo "nginx-affinity: 'nginx -t' falhou após editar ${conf} — restaurando backup" >&2
@@ -1692,7 +1814,7 @@ nginx_affinity() {
     cat "$bak" > "$conf"
     return 1
   fi
-  echo "nginx-affinity: ${conf} worker_cpu_affinity=${mode} (backup ${bak}, nginx -t OK)"
+  echo "nginx-affinity: ${conf} worker_cpu_affinity=${mode}${cpus:+ (workers em ${cpus})} (backup ${bak}, nginx -t OK)"
   nginx_reload "$bin"
 }
 
@@ -1729,6 +1851,9 @@ case "$ACTION" in
       irq=$(irq_for_queue "$IFACE" "$q") || continue
       [[ -z "$irq" ]] && continue
       cpu=$(cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null) || continue
+      if [[ "${3:-}" == core && "$cpu" =~ ^[0-9]+$ ]]; then
+        cpu=$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list" 2>/dev/null || echo "$cpu")
+      fi
       mask=$(cpulist_to_mask "$cpu") || continue
       echo "$mask" > "$tx/xps_cpus" 2>/dev/null || true
     done
@@ -1824,7 +1949,7 @@ case "$ACTION" in
     done
     ;;
   nginx-affinity)
-    nginx_affinity "${IFACE}" "${3:-on}"
+    nginx_affinity "${IFACE}" "${3:-on}" "${4:-}"
     ;;
   *)
     echo "Usage: $0 {cleanup|cleanup-global|mirror-xps|mirror-rps|arfs|arfs-global|ring-max|atr|pin-control|unpin-control|show-control|nginx-affinity|coalesce|offloads|pin-irq|show-irq|fix-qdisc} [iface_or_value] [total|cpulist|qdisc|ring|on|off]" >&2
@@ -1931,6 +2056,7 @@ write_systemd_unit() {
   (( APPLY_ARFS ))     && features="${features}+RFS"
   (( APPLY_CONTROL_PIN )) && features="${features}+CTRL"
   (( APPLY_NGINX ))    && features="${features}+NGINX"
+  (( APPLY_SMT_SPLIT )) && features="${features}+SMT"
 
   # Toda a lógica vive no helper — nenhum ExecStart carrega '$', backslash ou /bin/sh -c.
   # Motivo: o parser de ExecStart do systemd aplica C-unescape MESMO dentro de aspas simples
@@ -1967,10 +2093,18 @@ write_systemd_unit() {
   fi
   if (( APPLY_NGINX )); then
     # Reaplica no boot: se um update do XUI regravou o nginx.conf, a linha volta (idempotente).
-    nginx_lines=$'\n# nginx worker_cpu_affinity auto (--nginx-affinity)\nExecStart=-'"${HELPER_PATH}"$' nginx-affinity '"${NGINX_CONF}"$' on'
+    if (( APPLY_SMT_SPLIT )); then
+      nginx_lines=$'\n# nginx: workers nos irmãos SMT das filas (--nginx-affinity --smt-split)\nExecStart=-'"${HELPER_PATH}"$' nginx-affinity '"${NGINX_CONF}"$' on '"${APP_CPUS}"
+    else
+      nginx_lines=$'\n# nginx worker_cpu_affinity auto (--nginx-affinity)\nExecStart=-'"${HELPER_PATH}"$' nginx-affinity '"${NGINX_CONF}"$' on'
+    fi
   fi
   if (( APPLY_XPS )); then
-    xps_lines=$'\n# XPS per-queue espelhando IRQ (--xps)'"$(unit_lines '-' "mirror-xps %s")"
+    if (( APPLY_SMT_SPLIT )); then
+      xps_lines=$'\n# XPS per-queue no core inteiro: IRQ + irmão SMT (--smt-split)'"$(unit_lines '-' "mirror-xps %s core")"
+    else
+      xps_lines=$'\n# XPS per-queue espelhando IRQ (--xps)'"$(unit_lines '-' "mirror-xps %s")"
+    fi
   fi
   if (( APPLY_RPS )); then
     rps_lines=$'\n# RPS per-queue espelhando IRQ (--rps)'"$(unit_lines '-' "mirror-rps %s")"
