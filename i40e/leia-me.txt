@@ -1,0 +1,22 @@
+ cd /root && ./intel-xl710-tune-bond.sh --nginx-affinity
+
+  Esse comando aplica:
+  - o pinning das IRQs da placa por grupo de CPUs, com 24 filas por porta;
+  - o ring de 4096;
+  - o XPS;
+  - as IRQs de controle nas CPUs 0 e 24;
+  - a afinidade do nginx;
+  - a unit do systemd, para valer também depois do reboot.
+  
+  Antes de rodar, faça a simulação, que não altera nada:
+  ./intel-xl710-tune-bond.sh --dry-run --nginx-affinity
+
+  Se só uma porta estiver com link, como neste servidor hoje, o script aborta sozinho para não derrubar o tráfego. Nesse caso há duas opções:
+
+  - Sem queda: aplica tudo, menos a mudança de filas e de ring.
+  ./intel-xl710-tune-bond.sh --queues 48 --no-ring --nginx-affinity
+  - Tudo, mesmo com uma porta só: faça numa janela de manutenção, porque o LB fica fora alguns segundos, duas vezes.
+  ./intel-xl710-tune-bond.sh --nginx-affinity --allow-single-link
+
+  Para desfazer tudo:
+  ./intel-xl710-tune-bond.sh --rollback
