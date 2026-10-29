@@ -1,22 +1,72 @@
- cd /root && ./intel-xl710-tune-bond.sh --nginx-affinity
+intel-xl710-tune-bond.sh — tuning da placa Intel XL710/X710 (driver i40e) no LB do XUI.one
 
-  Esse comando aplica:
-  - o pinning das IRQs da placa por grupo de CPUs, com 24 filas por porta;
+Funciona em qualquer servidor com essa placa, com bond OU com uma placa só.
+O script detecta sozinho:
+  - existe bond0 (LACP)          -> modo bond, tuna as 2 portas
+  - não existe bond              -> modo placa única, na única porta i40e com link
+  - mais de uma porta com link   -> aborta e pede --nic <porta> ou --bond <nome>
+
+Ele calcula sozinho, para cada servidor:
+  - as CPUs das IRQs: as CPUs do NUMA da placa (num servidor de 2 sockets, só o
+    socket onde a placa está; ex.: 0-15,32-47);
+  - o número de filas: uma por CPU (ex.: 32);
+  - as CPUs das IRQs de controle: CPU0 + irmã SMT (ex.: 0,32 num host de 64 CPUs,
+    0,24 num de 48).
+Para conferir o que ele vai usar, sem alterar nada:
+  ./intel-xl710-tune-bond.sh --print-topology
+
+O comando completo aplica:
+  - o pinning das IRQs da placa nas CPUs do NUMA da placa, uma fila por CPU;
   - o ring de 4096;
   - o XPS;
-  - as IRQs de controle nas CPUs 0 e 24;
-  - a afinidade do nginx;
-  - a unit do systemd, para valer também depois do reboot.
-  
-  Antes de rodar, faça a simulação, que não altera nada:
-  ./intel-xl710-tune-bond.sh --dry-run --nginx-affinity
+  - as IRQs de controle na CPU0 + irmã SMT;
+  - a afinidade do nginx (--nginx-affinity);
+  - a unit do systemd (i40e-irq-pin.service), para valer também depois do reboot;
+  - desliga o irqbalance (de propósito: ele desfaria o pinning).
 
-  Se só uma porta estiver com link, como neste servidor hoje, o script aborta sozinho para não derrubar o tráfego. Nesse caso há duas opções:
 
-  - Sem queda: aplica tudo, menos a mudança de filas e de ring.
-  ./intel-xl710-tune-bond.sh --queues 48 --no-ring --nginx-affinity
-  - Tudo, mesmo com uma porta só: faça numa janela de manutenção, porque o LB fica fora alguns segundos, duas vezes.
-  ./intel-xl710-tune-bond.sh --nginx-affinity --allow-single-link
+1) SEMPRE simule antes (não altera nada):
 
-  Para desfazer tudo:
+  cd /root && ./intel-xl710-tune-bond.sh --dry-run --nginx-affinity
+
+  Leia as linhas [!] da saída. Se aparecer "o run real ABORTARIA", veja o item 3.
+
+
+2) Servidor COM bond e as duas portas com link:
+
+  cd /root && ./intel-xl710-tune-bond.sh --nginx-affinity
+
+  Uma porta é reconfigurada por vez; o LACP segura o tráfego na outra. Sem queda.
+
+
+3) Servidor SEM bond (placa única) ou bond com só uma porta com link:
+
+  Mudar filas e ring reseta a placa. Sem a outra porta para segurar o tráfego, o LB
+  pode ficar fora alguns segundos. Por isso o script aborta sozinho. Duas opções:
+
+  - Sem queda: aplica tudo, menos a mudança de filas e de ring. Use o número de filas
+    ATUAL da placa (o dry-run mostra qual é; costuma ser o número de CPUs do servidor):
+    ./intel-xl710-tune-bond.sh --queues <filas atuais> --no-ring --nginx-affinity
+    ex.: num servidor de 64 CPUs:  --queues 64 --no-ring --nginx-affinity
+
+  - Tudo: faça numa janela de manutenção.
+    ./intel-xl710-tune-bond.sh --nginx-affinity --allow-single-link
+
+  Se houver mais de uma porta com link e nenhum bond, indique a porta:
+    ./intel-xl710-tune-bond.sh --nic enp59s0f0np0 --nginx-affinity --allow-single-link
+
+  Sinal de que vale fazer o completo: o contador rx_missed_errors subindo (ring pequeno):
+    ethtool -S <porta> | grep -E 'rx_missed|rx_discards|rx_dropped'
+
+
+Depois de aplicar, acompanhe por 1 a 2 horas:
+  watch -d 'grep -E "i40e-<porta>-TxRx" /proc/interrupts | head'
+  ethtool -S <porta> | grep -E 'port.rx_discards|rx_dropped|rx_missed'
+
+
+Para desfazer tudo:
   ./intel-xl710-tune-bond.sh --rollback
+  (placa única: ./intel-xl710-tune-bond.sh --nic <porta> --rollback --allow-single-link)
+
+  O rollback não volta o ring, o coalesce nem os offloads (são estados benignos).
+  Backups do estado anterior ficam em /root/backups/.
