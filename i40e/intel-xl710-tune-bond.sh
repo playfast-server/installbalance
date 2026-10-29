@@ -18,6 +18,8 @@
 #   ./intel-xl710-tune-bond.sh --no-qdisc                # pula a regeneração do qdisc das tx queues
 #   ./intel-xl710-tune-bond.sh --dry-run                 # mostra o que faria, sem escrever
 #   ./intel-xl710-tune-bond.sh --bond bond0              # nome do bond (default bond0)
+#   ./intel-xl710-tune-bond.sh --nic enp59s0f0np0        # PLACA ÚNICA (sem bond) nesta interface
+#   ./intel-xl710-tune-bond.sh --cpus 'lista'            # cpulist da placa única (= --slave0-cpus)
 #   ./intel-xl710-tune-bond.sh --queues N                # override do combined queues por slave
 #   ./intel-xl710-tune-bond.sh --slave0-cpus 'lista'     # override do cpulist do slave 0
 #   ./intel-xl710-tune-bond.sh --slave1-cpus 'lista'     # override do cpulist do slave 1
@@ -25,9 +27,20 @@
 #   ./intel-xl710-tune-bond.sh --no-control-pin          # NÃO pina as IRQs de controle (misc/fdir/ahci/PCIe/...)
 #   ./intel-xl710-tune-bond.sh --nginx-affinity          # + worker_cpu_affinity auto no nginx do XUI (reload gracioso)
 #   ./intel-xl710-tune-bond.sh --nginx-conf PATH         # conf do nginx (default /home/xui/bin/nginx/conf/nginx.conf)
-#   ./intel-xl710-tune-bond.sh --allow-single-link       # aplica mesmo com só 1 slave com link (HAVERÁ queda)
+#   ./intel-xl710-tune-bond.sh --allow-single-link       # aplica mesmo com só 1 link ativo (bond com 1 slave
+#                                                        #   ou placa única): HAVERÁ queda nos resets
 #   ./intel-xl710-tune-bond.sh --no-systemd              # aplica em runtime, não persiste
 #   ./intel-xl710-tune-bond.sh --rollback                # reverte tudo
+#
+# Modo (detectado sozinho, serve para qualquer servidor com XL710/X710):
+#   - --nic IFACE                    -> placa única naquela interface
+#   - existe /proc/net/bonding/bond0 -> bond (2 slaves; --bond muda o nome)
+#   - sem bond e sem --nic           -> placa única, se houver exatamente UMA i40e com link;
+#                                       senão aborta pedindo --nic/--bond
+#   Em placa única não há LACP para segurar o tráfego: ethtool -L/-G (filas/ring) derrubam o
+#   LB por alguns segundos. O script aborta nesse caso, a menos que venha --allow-single-link
+#   (janela de manutenção). Sem queda: --queues <atual> --no-ring.
+#   CPUs default em placa única: todas as CPUs do NUMA local da placa.
 #
 # Diferenças em relação à versão Mellanox (mlx5):
 #   - IRQs de dados: i40e-<iface>-TxRx-N (mlx5: mlx5_compN@pci:<bdf>). Os vetores
@@ -97,6 +110,11 @@ SLAVE_WAIT_SECS=45               # quanto esperar um slave voltar ao bond após 
 BOOT_RESET_SLEEP=6               # sleep no unit após ethtool -L/-G (sem como esperar o LACP lá)
 
 BOND="bond0"
+BOND_EXPLICIT=0      # --bond passado: sem esse bond é erro (não cai para placa única)
+NIC=""               # --nic IFACE: modo placa única
+SINGLE=0             # 1 = placa única (sem bond); definido em resolve_mode
+IFACES=()            # interfaces a tunar (1 em placa única, 2 em bond)
+SLAVE0=""; SLAVE1=""
 # Vazios = auto-detect; preenchidos por flag = override manual.
 SLAVES=()
 SLAVE0_CPUS=""
@@ -186,8 +204,9 @@ normalize_cpulist() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)              DRY_RUN=1 ;;
-    --bond)                 need_arg "$1" "${2-}"; BOND="$2"; shift ;;
-    --slave0-cpus)          need_arg "$1" "${2-}"; SLAVE0_CPUS="$2"; shift ;;
+    --bond)                 need_arg "$1" "${2-}"; BOND="$2"; BOND_EXPLICIT=1; shift ;;
+    --nic)                  need_arg "$1" "${2-}"; NIC="$2"; shift ;;
+    --slave0-cpus|--cpus)   need_arg "$1" "${2-}"; SLAVE0_CPUS="$2"; shift ;;
     --slave1-cpus)          need_arg "$1" "${2-}"; SLAVE1_CPUS="$2"; shift ;;
     --queues)               need_arg "$1" "${2-}"; QUEUES="$2"; shift ;;
     --no-systemd)           PERSIST=0 ;;
@@ -231,6 +250,9 @@ CONTROL_CPUS=$(normalize_cpulist --control-cpus "$CONTROL_CPUS")
 # Caminho vai para ExecStart do systemd: nada de espaço, '$' ou backslash.
 [[ "$NGINX_CONF" =~ ^/[A-Za-z0-9._/+-]+$ ]] || { err "--nginx-conf '${NGINX_CONF}': use um caminho absoluto simples"; exit 1; }
 [[ -z "$QUEUES" || "$QUEUES" =~ ^[1-9][0-9]*$ ]] || { err "--queues '${QUEUES}' não é inteiro positivo"; exit 1; }
+[[ -z "$NIC" || "$NIC" =~ ^[A-Za-z0-9._-]+$ ]] || { err "--nic '${NIC}': nome de interface inválido"; exit 1; }
+[[ -z "$NIC" || -d "/sys/class/net/$NIC" ]] || { err "--nic: interface '${NIC}' não existe"; exit 1; }
+(( ! BOND_EXPLICIT )) || [[ -z "$NIC" ]] || { err "--bond e --nic são exclusivos"; exit 1; }
 
 # ---------------- helpers de máscara ----------------
 
@@ -300,8 +322,8 @@ PY
 topology_json() {
   local slaves_csv
   # Resolve os slaves sozinho quando chamado antes do preflight (--print-topology).
-  if [[ -z "${SLAVES[*]:-}" && -f "/proc/net/bonding/${BOND}" ]]; then
-    mapfile -t SLAVES < <(awk '/^Slave Interface:/{print $3}' "/proc/net/bonding/${BOND}" | sort)
+  if [[ -z "${SLAVES[*]:-}" ]]; then
+    resolve_mode quiet || true
   fi
   slaves_csv=$(IFS=,; echo "${SLAVES[*]:-}")
   python3 - "$slaves_csv" <<'PY'
@@ -622,8 +644,90 @@ print_topology() {
 
 # ---------------- pré-flight ----------------
 
-# Garante que um binário (e, opcionalmente, seu pacote APT) esteja disponível.
-# Em DRY-RUN, simula a instalação e segue.
+# ---------------- modo: bond ou placa única ----------------
+
+# Define SINGLE, IFACES (interfaces a tunar, 1 ou 2) e SLAVE0/SLAVE1.
+#   --nic IFACE              -> placa única
+#   /proc/net/bonding/$BOND  -> bond (2 slaves)
+#   nenhum dos dois          -> auto: se houver exatamente UMA i40e com link, placa única
+# $1=quiet: devolve 1 em vez de abortar (usado por --print-topology).
+resolve_mode() {
+  local quiet="${1:-}"
+  if [[ -n "$NIC" ]]; then
+    SINGLE=1; IFACES=("$NIC")
+  elif [[ -f "/proc/net/bonding/${BOND}" ]]; then
+    SINGLE=0
+    # Ordena alfabeticamente: a ordem em /proc/net/bonding depende de quem subiu primeiro,
+    # não é estável entre reboots. Ordenar garante slave0 sempre = ...f0np0, slave1 = ...f1np1.
+    mapfile -t SLAVES < <(awk '/^Slave Interface:/{print $3}' "/proc/net/bonding/${BOND}" | sort)
+    if (( ${#SLAVES[@]} < 2 )); then
+      [[ -n "$quiet" ]] && return 1
+      err "bond ${BOND} tem menos de 2 slaves (${SLAVES[*]:-nenhum}). Para uma placa só use --nic <iface>."; exit 1
+    fi
+    if (( ${#SLAVES[@]} > 2 )) && [[ -z "$quiet" ]]; then
+      warn "bond ${BOND} tem ${#SLAVES[@]} slaves (${SLAVES[*]}); script só pina os 2 primeiros (${SLAVES[0]}, ${SLAVES[1]}) — slaves extras ficarão sem pinning"
+    fi
+    IFACES=("${SLAVES[0]}" "${SLAVES[1]}")
+  elif (( BOND_EXPLICIT )); then
+    [[ -n "$quiet" ]] && return 1
+    err "bond '${BOND}' não existe em /proc/net/bonding/. Para uma placa só use --nic <iface>."; exit 1
+  else
+    local -a cands=()
+    local d n
+    for d in /sys/class/net/*; do
+      n="${d##*/}"
+      [[ "$(basename "$(readlink "$d/device/driver" 2>/dev/null)" 2>/dev/null)" == i40e ]] || continue
+      [[ -e "$d/master" ]] && continue
+      [[ "$(cat "$d/carrier" 2>/dev/null)" == 1 ]] && cands+=("$n")
+    done
+    if (( ${#cands[@]} != 1 )); then
+      [[ -n "$quiet" ]] && return 1
+      err "sem bond '${BOND}' e ${#cands[@]} placa(s) i40e com link (${cands[*]:-nenhuma})."
+      err "  Passe --nic <iface> (placa única) ou --bond <nome>."
+      exit 1
+    fi
+    SINGLE=1; IFACES=("${cands[0]}")
+    [[ -n "$quiet" ]] || warn "sem bond '${BOND}': modo PLACA ÚNICA em ${cands[0]} (única i40e com link; force com --nic)"
+  fi
+  SLAVES=("${IFACES[@]}")
+  SLAVE0="${IFACES[0]}"
+  SLAVE1="${IFACES[1]:-}"
+  if (( SINGLE )); then
+    [[ -z "$SLAVE1_CPUS" ]] || { err "--slave1-cpus não se aplica em placa única (use --cpus)"; exit 1; }
+    if [[ -e "/sys/class/net/${SLAVE0}/master" && -z "$quiet" ]]; then
+      warn "${SLAVE0} é slave de $(basename "$(readlink -f "/sys/class/net/${SLAVE0}/master")") — o normal seria rodar em modo bond (--bond)"
+    fi
+  fi
+  return 0
+}
+
+# Acessores por índice de IFACES (0 = slave0/placa única, 1 = slave1).
+cpus_of()   { (( $1 == 0 )) && echo "$SLAVE0_CPUS" || echo "$SLAVE1_CPUS"; }
+queues_of() { (( $1 == 0 )) && echo "$QUEUES_S0"   || echo "$QUEUES_S1"; }
+# "iface=cpus/q=N, ..." (all) ou "iface=N, ..." (q)
+ifaces_summary() {
+  local i out=""
+  for i in "${!IFACES[@]}"; do
+    [[ -n "$out" ]] && out+=", "
+    if [[ "$1" == q ]]; then out+="${IFACES[i]}=$(queues_of "$i")"
+    else out+="${IFACES[i]}=$(cpus_of "$i")/q=$(queues_of "$i")"; fi
+  done
+  printf '%s' "$out"
+}
+# Linhas ExecStart do helper, uma por interface. $1 = prefixo ('-' ou ''), $2 = argumentos
+# com %s no lugar da iface, $3 = "sleep" para intercalar /bin/sleep (reset da PF).
+unit_lines() {
+  local pfx="$1" fmt="$2" sl="${3:-}" s
+  for s in "${IFACES[@]}"; do
+    # shellcheck disable=SC2059
+    printf '\nExecStart=%s%s %s' "$pfx" "$HELPER_PATH" "$(printf "$fmt" "$s")"
+    if [[ -n "$sl" ]]; then printf '\nExecStart=/bin/sleep %s' "$BOOT_RESET_SLEEP"; fi
+  done
+  return 0   # usada em $(...) numa atribuição: status != 0 derrubaria o script (set -e)
+}
+
+# ---------------- pré-flight ----------------
+
 preflight() {
   log "pré-flight"
   command -v ethtool  >/dev/null || { err "ethtool não instalado (apt install ethtool)"; exit 1; }
@@ -634,40 +738,37 @@ preflight() {
     APPLY_QDISC=0
   fi
 
-  [[ -f "/proc/net/bonding/${BOND}" ]] || {
-    err "bond '${BOND}' não existe em /proc/net/bonding/. Passe --bond <nome>."; exit 1;
-  }
+  resolve_mode
 
-  # Ordena alfabeticamente: a ordem em /proc/net/bonding depende de quem subiu primeiro,
-  # não é estável entre reboots. Ordenar garante slave0 sempre = ...f0np0, slave1 = ...f1np1.
-  mapfile -t SLAVES < <(awk '/^Slave Interface:/{print $3}' "/proc/net/bonding/${BOND}" | sort)
-  (( ${#SLAVES[@]} >= 2 )) || { err "bond ${BOND} tem menos de 2 slaves: ${SLAVES[*]}"; exit 1; }
-  if (( ${#SLAVES[@]} > 2 )); then
-    warn "bond ${BOND} tem ${#SLAVES[@]} slaves (${SLAVES[*]}); script só pina os 2 primeiros (${SLAVES[0]}, ${SLAVES[1]}) — slaves extras ficarão sem pinning"
-  fi
-
-  SLAVE0="${SLAVES[0]}"
-  SLAVE1="${SLAVES[1]}"
-
-  for s in "$SLAVE0" "$SLAVE1"; do
+  local s
+  for s in "${IFACES[@]}"; do
     [[ -d "/sys/class/net/$s" ]] || { err "interface $s não existe em /sys/class/net"; exit 1; }
     local drv
     drv=$(basename "$(readlink "/sys/class/net/$s/device/driver" 2>/dev/null)" 2>/dev/null || echo "?")
     [[ "$drv" == i40e ]] || warn "$s usa driver '$drv' (esperado i40e) — script segue mesmo assim"
+    # O i40e só registra as IRQs TxRx no open (interface UP). Sem elas o pin-irq falharia
+    # DEPOIS do cleanup, com o irqbalance já desligado — abortar aqui, antes de mexer.
+    if (( ! ROLLBACK )) && ! awk -v p="i40e-${s}-" 'index($NF, p) == 1 && substr($NF, length(p) + 1) ~ /^(TxRx|rx|tx)-[0-9]+$/ { f = 1 } END { exit !f }' /proc/interrupts; then
+      err "$s sem IRQs i40e-${s}-TxRx-* em /proc/interrupts (interface DOWN? operstate=$(cat "/sys/class/net/$s/operstate" 2>/dev/null))"
+      err "  suba a interface (ip link set $s up) ou rode em outra (--nic)"
+      exit 1
+    fi
   done
 
-  # Auto-detect só se NÃO veio override de --slave*-cpus ou --queues.
+  # Auto-detect só se NÃO veio override de --cpus/--slave*-cpus ou --queues.
   resolve_topology
 
-  # ethtool -L/-G no i40e derrubam o carrier do slave por alguns segundos. Com os dois slaves
-  # com link, o LACP segura o tráfego no outro; com um só, resetar o slave ativo é queda total
-  # do LB. Só bloqueia se algum reset vai de fato cair num slave com link.
+  # ethtool -L/-G no i40e derrubam o carrier por alguns segundos. Em bond com os dois slaves
+  # com link, o LACP segura o tráfego no outro; com um slave só, ou em placa única, resetar a
+  # interface ativa é queda total do LB. Só bloqueia se algum reset vai de fato cair numa
+  # interface com link.
   if (( ! ROLLBACK )); then
-    local up_n=0 resets=() q t
-    for s in "$SLAVE0" "$SLAVE1"; do
+    local up_n=0 resets=() q t i where
+    for i in "${!IFACES[@]}"; do
+      s="${IFACES[i]}"
       slave_in_bond_up "$s" || continue
       up_n=$(( up_n + 1 ))
-      [[ "$s" == "$SLAVE0" ]] && q="$QUEUES_S0" || q="$QUEUES_S1"
+      q=$(queues_of "$i")
       [[ "$(ethtool_combined_current "$s")" == "$q" ]] || resets+=("$s:combined->${q}")
       if (( APPLY_RING_MAX )); then
         t=$(ring_target "$s")
@@ -675,53 +776,56 @@ preflight() {
           || resets+=("$s:ring->${t}")
       fi
     done
-    if (( up_n < 2 && ${#resets[@]} > 0 )); then
+    if (( SINGLE )); then where="placa única ${SLAVE0} (sem bond)"; else where="só ${up_n} slave(s) com link no ${BOND}"; fi
+    if (( ( SINGLE || up_n < 2 ) && ${#resets[@]} > 0 )); then
       if (( ALLOW_SINGLE_LINK )); then
-        warn "só ${up_n} slave(s) com link no ${BOND} — --allow-single-link: o tráfego VAI cair durante: ${resets[*]}"
+        warn "${where} — --allow-single-link: o tráfego VAI cair durante: ${resets[*]}"
       elif (( DRY_RUN )); then
-        warn "só ${up_n} slave(s) com link no ${BOND}: o run real ABORTARIA (resets no slave ativo: ${resets[*]})"
+        warn "${where}: o run real ABORTARIA (resets na interface ativa: ${resets[*]})"
         warn "  sem queda: --queues $(ethtool_combined_current "$SLAVE0") --no-ring  |  com janela: --allow-single-link"
       else
-        err "só ${up_n} slave(s) com link no ${BOND}: estes resets derrubariam todo o tráfego: ${resets[*]}"
+        err "${where}: estes resets derrubariam todo o tráfego: ${resets[*]}"
         err "  Sem queda: mantenha filas/ring atuais (--queues $(ethtool_combined_current "$SLAVE0") --no-ring)."
-        err "  Com janela de manutenção: --allow-single-link. Ou conserte o link do outro slave."
+        err "  Com janela de manutenção: --allow-single-link.$( (( SINGLE )) || echo ' Ou conserte o link do outro slave.')"
         exit 1
       fi
     fi
   fi
 
-  ok "bond=${BOND}"
-  ok "  slave0=${SLAVE0} CPUs=${SLAVE0_CPUS} queues=${QUEUES_S0}"
-  ok "  slave1=${SLAVE1} CPUs=${SLAVE1_CPUS} queues=${QUEUES_S1}"
+  if (( SINGLE )); then
+    ok "modo=placa única"
+    ok "  nic=${SLAVE0} CPUs=${SLAVE0_CPUS} queues=${QUEUES_S0}"
+  else
+    ok "modo=bond ${BOND}"
+    ok "  slave0=${SLAVE0} CPUs=${SLAVE0_CPUS} queues=${QUEUES_S0}"
+    ok "  slave1=${SLAVE1} CPUs=${SLAVE1_CPUS} queues=${QUEUES_S1}"
+  fi
 
-
-  # Coerência queues vs logical CPUs do split — warn only, o pinning round-robin tolera.
-  local n0 n1
-  n0=$(count_cpus_in_list "$SLAVE0_CPUS")
-  n1=$(count_cpus_in_list "$SLAVE1_CPUS")
-  if (( QUEUES_S0 < n0 )); then warn "slave0: ${QUEUES_S0} queues < ${n0} logical CPUs — IRQs só pinarão nas primeiras ${QUEUES_S0} CPUs"; fi
-  if (( QUEUES_S1 < n1 )); then warn "slave1: ${QUEUES_S1} queues < ${n1} logical CPUs — IRQs só pinarão nas primeiras ${QUEUES_S1} CPUs"; fi
+  # Coerência queues vs logical CPUs — warn only, o pinning round-robin tolera.
+  local n q
+  for i in "${!IFACES[@]}"; do
+    n=$(count_cpus_in_list "$(cpus_of "$i")"); q=$(queues_of "$i")
+    (( q < n )) && warn "${IFACES[i]}: ${q} queues < ${n} logical CPUs — IRQs só pinarão nas primeiras ${q} CPUs"
+    (( q > n )) && warn "${IFACES[i]}: ${q} queues > ${n} logical CPUs — round-robin: algumas CPUs ficam com mais de uma fila"
+  done
+  return 0
 }
 
-# Resolve SLAVE0_CPUS / SLAVE1_CPUS / QUEUES.
-# Roda auto-detect só pra preencher o que FALTA. Em seguida, recalcula n_logical
-# dos valores FINAIS (pra que QUEUES respeite overrides via --slave*-cpus).
+# Resolve SLAVE0_CPUS / SLAVE1_CPUS / QUEUES_S0 / QUEUES_S1 (este par só em bond).
+# Roda auto-detect só pra preencher o que FALTA; QUEUES sai dos cpulists FINAIS.
 resolve_topology() {
-  # Auto-detect roda se PELO MENOS um dos cpulists ainda está vazio.
-  # (Se ambos overrides foram passados, autodetect é dispensável; QUEUES é calculado
-  # depois usando os valores finais.)
-  local need_auto=0
-  [[ -z "$SLAVE0_CPUS" || -z "$SLAVE1_CPUS" ]] && need_auto=1
+  local need_auto=0 i
+  [[ -z "$SLAVE0_CPUS" ]] && need_auto=1
+  (( ! SINGLE )) && [[ -z "$SLAVE1_CPUS" ]] && need_auto=1
 
   if (( need_auto )); then
-    log "auto-detect de topologia (cpulist faltando para algum slave)"
+    log "auto-detect de topologia (cpulist faltando)"
     local json
     json=$(topology_json)
     if ! TOPO_JSON="$json" python3 -c 'import json,os; d=json.loads(os.environ["TOPO_JSON"]); raise SystemExit(1 if "error" in d else 0)' 2>/dev/null; then
       err "auto-detect falhou: $json"; exit 1
     fi
 
-    # Imprimir resumo da topologia detectada
     TOPO_JSON="$json" python3 - <<'PY'
 import json, os
 d = json.loads(os.environ["TOPO_JSON"])
@@ -733,69 +837,45 @@ print("    dominio de cache: %s x %s (fonte: %s)" % (
     len(tp.get("domains") or []), tp.get("domain_label", "?"), tp.get("domain_source", "?")))
 for w in d.get("warnings", []):
     print(f"\033[1;33m[!]\033[0m topologia: {w}")
-print("    split por slave:")
+print("    split por interface:")
 for s in d["slaves"]:
     ccxs = " | ".join(s["ccxs"])
     print(f"      {s['iface']:<20s} numa={s['numa']:>2} CCXs=[{ccxs}] CPUs={s['cpus']} ({s['n_logical']} logical)")
 PY
 
-    local auto_s0 auto_s1
-    auto_s0=$(TOPO_JSON="$json" python3 -c 'import json,os; print(json.loads(os.environ["TOPO_JSON"])["slaves"][0]["cpus"])')
-    auto_s1=$(TOPO_JSON="$json" python3 -c 'import json,os; print(json.loads(os.environ["TOPO_JSON"])["slaves"][1]["cpus"])')
-
-    [[ -z "$SLAVE0_CPUS" ]] && SLAVE0_CPUS="$auto_s0"
-    [[ -z "$SLAVE1_CPUS" ]] && SLAVE1_CPUS="$auto_s1"
+    local auto
+    for i in "${!IFACES[@]}"; do
+      auto=$(TOPO_JSON="$json" python3 -c 'import json,os,sys; print(json.loads(os.environ["TOPO_JSON"])["slaves"][int(sys.argv[1])]["cpus"])' "$i")
+      if (( i == 0 )); then [[ -z "$SLAVE0_CPUS" ]] && SLAVE0_CPUS="$auto"
+      else                  [[ -z "$SLAVE1_CPUS" ]] && SLAVE1_CPUS="$auto"; fi
+    done
   else
-    log "topologia 100% via flags --slave0-cpus/--slave1-cpus (auto-detect skipado)"
+    log "topologia 100% via flags de cpulist (auto-detect skipado)"
   fi
 
-  # SEMPRE conta n_logical a partir dos valores FINAIS de SLAVE0_CPUS/SLAVE1_CPUS,
-  # não do auto-detect. Isso garante que --slave*-cpus override seja respeitado.
-  local n_logical_s0 n_logical_s1
-  n_logical_s0=$(count_cpus_in_list "$SLAVE0_CPUS")
-  n_logical_s1=$(count_cpus_in_list "$SLAVE1_CPUS")
-
-  # Resolve QUEUES_S0 e QUEUES_S1 automaticamente:
-  #   - se --queues N foi passado: aplica N em ambos
-  #   - senão: cada slave = min(n_cpus_do_slave, max-combined_do_slave)
-  local maxq0 maxq1
-  maxq0=$(ethtool_combined_max "$SLAVE0")
-  maxq1=$(ethtool_combined_max "$SLAVE1")
-  maxq0=${maxq0:-0}
-  maxq1=${maxq1:-0}
-
-  if [[ -n "$QUEUES" ]]; then
-    QUEUES_S0="$QUEUES"
-    QUEUES_S1="$QUEUES"
-    ok "queues forçado via --queues: ${SLAVE0}=${QUEUES_S0}, ${SLAVE1}=${QUEUES_S1}"
-  else
-    QUEUES_S0=$(( n_logical_s0 < maxq0 ? n_logical_s0 : maxq0 ))
-    QUEUES_S1=$(( n_logical_s1 < maxq1 ? n_logical_s1 : maxq1 ))
-    ok "queues calculado: ${SLAVE0}=${QUEUES_S0} (cpus=${n_logical_s0}, max=${maxq0}); ${SLAVE1}=${QUEUES_S1} (cpus=${n_logical_s1}, max=${maxq1})"
-  fi
-
-  # Sanity ANTES de qualquer escrita: um QUEUES_S* inválido (0, negativo, vazio, acima do
-  # max) só seria detectado pelo ethtool -L lá na frente, com a NIC já mexida e o irqbalance
-  # já desabilitado. single/mlx4 já validavam isto; o bond não.
-  local qv
-  for qv in QUEUES_S0 QUEUES_S1; do
-    [[ "${!qv}" =~ ^[0-9]+$ ]] || { err "${qv}='${!qv}' não é inteiro (max combined ilegível ou --queues inválido)"; exit 1; }
+  # Resolve QUEUES por interface:
+  #   - --queues N: N em todas
+  #   - senão: min(n_cpus da interface, max-combined da interface)
+  local n maxq q msg=""
+  for i in "${!IFACES[@]}"; do
+    n=$(count_cpus_in_list "$(cpus_of "$i")")
+    maxq=$(ethtool_combined_max "${IFACES[i]}"); maxq=${maxq:-0}
+    if [[ -n "$QUEUES" ]]; then q="$QUEUES"; else q=$(( n < maxq ? n : maxq )); fi
+    # Sanity ANTES de qualquer escrita: um valor inválido só seria pego pelo ethtool -L lá
+    # na frente, com a NIC já mexida e o irqbalance já desabilitado.
+    [[ "$q" =~ ^[0-9]+$ ]] || { err "${IFACES[i]}: queues='${q}' não é inteiro (max combined ilegível?)"; exit 1; }
+    if (( q < 1 )); then
+      err "${IFACES[i]}: queues resolvido para ${q} (precisa ser >= 1)."
+      err "  Se 'max combined' saiu 0, o i40e não reportou canais (VF? driver iavf?) — confira 'ethtool -l'"
+      exit 1
+    fi
+    (( q <= maxq )) || { err "${IFACES[i]}: queues ${q} acima do máximo do device (${maxq})"; exit 1; }
+    if (( i == 0 )); then QUEUES_S0="$q"; else QUEUES_S1="$q"; fi
+    msg+="${IFACES[i]}=${q} (cpus=${n}, max=${maxq}) "
   done
-  if (( QUEUES_S0 < 1 || QUEUES_S1 < 1 )); then
-    err "queues resolvido para ${SLAVE0}=${QUEUES_S0} ${SLAVE1}=${QUEUES_S1} (precisa ser >= 1)."
-    err "  Se 'max combined' saiu 0, o i40e não reportou canais (VF? driver iavf?) — confira 'ethtool -l'"
-    exit 1
-  fi
-  if (( QUEUES_S0 > maxq0 || QUEUES_S1 > maxq1 )); then
-    err "queues acima do máximo do device: ${SLAVE0}=${QUEUES_S0}/${maxq0}, ${SLAVE1}=${QUEUES_S1}/${maxq1}"
-    exit 1
-  fi
+  if [[ -n "$QUEUES" ]]; then ok "queues forçado via --queues: ${msg}"; else ok "queues calculado: ${msg}"; fi
 
-  # Validação NUMA: warn (não-fatal). Se 2 slaves compartilham PCI controller mas
-  # BIOS reporta NUMAs divergentes, validate_numa consolida via controller (pega
-  # o menor) — corrige relatos errôneos do BIOS.
-  validate_numa_for_slave "$SLAVE0" "$SLAVE0_CPUS"
-  validate_numa_for_slave "$SLAVE1" "$SLAVE1_CPUS"
+  for i in "${!IFACES[@]}"; do validate_numa_for_slave "${IFACES[i]}" "$(cpus_of "$i")"; done
 }
 
 # Avisa (sem abortar) se cpulist tem CPUs fora do NUMA da NIC.
@@ -829,7 +909,7 @@ backup_state() {
   log "backup do estado atual em ${BACKUP_DIR}"
   run "mkdir -p '${BACKUP_DIR}'"
   run "cp -a /proc/interrupts '${BACKUP_DIR}/interrupts.pre-pin-${STAMP}.txt'"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     run "${HELPER_PATH} show-irq '$s' > '${BACKUP_DIR}/affinity.${s}.pre-pin-${STAMP}.txt' 2>&1 || true"
   done
   run "systemctl is-enabled irqbalance > '${BACKUP_DIR}/irqbalance.pre-pin-${STAMP}.txt' 2>&1 || true"
@@ -853,9 +933,11 @@ stop_irqbalance() {
 # ---------------- estado do slave no bond ----------------
 
 # 0 se o slave tem carrier E aparece com "MII Status: up" no /proc/net/bonding do bond.
+# Em placa única: só o carrier.
 slave_in_bond_up() {
   local s="$1"
   [[ "$(cat "/sys/class/net/$s/carrier" 2>/dev/null)" == 1 ]] || return 1
+  (( SINGLE )) && return 0
   awk -v s="$s" '
     /^Slave Interface:/ { cur = $3; next }
     cur == s && /^MII Status:/ { st = $3; exit }
@@ -868,21 +950,21 @@ slave_in_bond_up() {
 # estava up antes ($2=1): um slave sem cabo não vai voltar e não deve travar o script.
 wait_slave_back() {
   local s="$1" was_up="$2" i
-  (( DRY_RUN )) && { printf '\033[1;90m    DRY: esperar %s voltar ao %s (até %ss)\033[0m\n' "$s" "$BOND" "$SLAVE_WAIT_SECS" >&2; return 0; }
+  (( DRY_RUN )) && { printf '\033[1;90m    DRY: esperar %s voltar (%s, até %ss)\033[0m\n' "$s" "$( (( SINGLE )) && echo link || echo "$BOND")" "$SLAVE_WAIT_SECS" >&2; return 0; }
   (( was_up )) || { sleep 2; return 0; }
   # O carrier pode demorar ~1s para cair depois do ioctl; sem este sleep o primeiro check
   # ainda vê o estado antigo e o script segue com o slave a caminho de cair.
   sleep 2
   for (( i=0; i<SLAVE_WAIT_SECS; i++ )); do
     if slave_in_bond_up "$s"; then
-      ok "$s de volta ao ${BOND} (${i}s após o reset)"
+      ok "$s de volta $( (( SINGLE )) && echo 'com link' || echo "ao ${BOND}") (${i}s após o reset)"
       # LACP slow: o partner leva alguns segundos para recolocar o port no aggregator.
       sleep 3
       return 0
     fi
     sleep 1
   done
-  err "$s não voltou ao ${BOND} em ${SLAVE_WAIT_SECS}s — abortando antes de mexer no outro slave"
+  err "$s não voltou $( (( SINGLE )) && echo 'com link' || echo "ao ${BOND}") em ${SLAVE_WAIT_SECS}s — abortando"
   exit 1
 }
 
@@ -901,24 +983,25 @@ ethtool_combined_max() {
 # Default do i40e no probe: min(CPUs online, max combined). Usado no rollback.
 ethtool_combined_default() {
   local maxq ncpu
-  maxq=$(ethtool_combined_max "$1"); ncpu=$(nproc 2>/dev/null || echo 1)
+  maxq=$(ethtool_combined_max "$1"); ncpu=$(count_cpus_in_list "$(cat /sys/devices/system/cpu/online)")
   [[ -n "$maxq" ]] || return 0
   echo $(( ncpu < maxq ? ncpu : maxq ))
 }
 
 apply_queue_count() {
-  log "ajustando combined queues por slave: ${SLAVE0}=${QUEUES_S0}, ${SLAVE1}=${QUEUES_S1}"
+  log "ajustando combined queues: $(ifaces_summary q)"
   local s q cur err_log was_up
   err_log="/tmp/xui-ethtool-err.$$"
-  for entry in "$SLAVE0:$QUEUES_S0" "$SLAVE1:$QUEUES_S1"; do
-    s="${entry%:*}"
-    q="${entry#*:}"
+  local i
+  for i in "${!IFACES[@]}"; do
+    s="${IFACES[i]}"
+    q=$(queues_of "$i")
     cur=$(ethtool_combined_current "$s")
     if [[ "$cur" == "$q" ]]; then
       ok "$s já em Combined=${q}, sem mudança (sem reset)"
       continue
     fi
-    log "$s: Combined ${cur:-?} → ${q} (reset da PF: o link deste slave cai por alguns segundos)"
+    log "$s: Combined ${cur:-?} → ${q} (reset da PF: o link desta interface cai por alguns segundos)"
     if (( DRY_RUN )); then
       printf '\033[1;90m    DRY: ethtool -L %s combined %s\033[0m\n' "$s" "$q" >&2
       wait_slave_back "$s" 1
@@ -956,8 +1039,8 @@ on_exit() {
   (( STATE_DIRTY )) || return 0
   err "ABORTO (rc=${rc}) depois do cleanup — repinando IRQs para não deixar a NIC sem afinidade"
   if [[ -x "${HELPER_PATH}" ]]; then
-    "${HELPER_PATH}" pin-irq "${SLAVE0:-}" "${SLAVE0_CPUS:-}" || true
-    "${HELPER_PATH}" pin-irq "${SLAVE1:-}" "${SLAVE1_CPUS:-}" || true
+    local i
+    for i in "${!IFACES[@]}"; do "${HELPER_PATH}" pin-irq "${IFACES[i]}" "$(cpus_of "$i")" || true; done
   fi
   err "  irqbalance continua DESABILITADO (por design). Revise o estado com: $0 --dry-run"
 }
@@ -976,9 +1059,8 @@ trap on_exit EXIT
 # Chamado ANTES do ethtool -L, com as filas atuais: no i40e as filas que somem ao reduzir
 # têm o kobject removido, então não sobra estado herdado para quando voltarem.
 cleanup_existing_state() {
-  log "CLEANUP TOTAL — IRQ, RPS, XPS, RFS em ambos os slaves"
-  run "${HELPER_PATH} cleanup ${SLAVE0}"
-  run "${HELPER_PATH} cleanup ${SLAVE1}"
+  log "CLEANUP TOTAL — IRQ, RPS, XPS, RFS em ${IFACES[*]}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} cleanup ${s}"; done
   run "${HELPER_PATH} cleanup-global"
   STATE_DIRTY=1
   ok "estado limpo (pronto para aplicar)"
@@ -1018,9 +1100,9 @@ ring_target() {
 
 apply_ring_max() {
   (( APPLY_RING_MAX )) || { warn "ring desabilitado (--no-ring)"; return; }
-  log "ajustando ring size (alvo ${RING_SIZE/#0/máximo}) — um slave por vez (down/up da VSI)"
+  log "ajustando ring size (alvo ${RING_SIZE/#0/máximo}) — uma interface por vez (down/up da VSI)"
   local s t was_up
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     t=$(ring_target "$s")
     [[ -n "$t" ]] || { warn "$s: ethtool -g sem máximos utilizáveis — pulando"; continue; }
     if [[ "$(ethtool_ring "$s" current RX)" == "$t" && "$(ethtool_ring "$s" current TX)" == "$t" ]]; then
@@ -1038,26 +1120,23 @@ apply_ring_max() {
 # curtos ou que migram de CPU pode gerar reordenação — por isso o controle explícito.
 apply_atr() {
   [[ -n "$ATR_STATE" ]] || return 0
-  log "Flow Director ATR → ${ATR_STATE} em ambos os slaves"
-  run "${HELPER_PATH} atr ${SLAVE0} ${ATR_STATE}"
-  run "${HELPER_PATH} atr ${SLAVE1} ${ATR_STATE}"
+  log "Flow Director ATR → ${ATR_STATE} em ${IFACES[*]}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} atr ${s} ${ATR_STATE}"; done
 }
 
 apply_coalesce_adaptive() {
   (( APPLY_COALESCE )) || { warn "coalesce adaptive desabilitado (--no-coalesce)"; return; }
-  log "habilitando adaptive coalescing em ambos os slaves"
-  run "${HELPER_PATH} coalesce ${SLAVE0}"
-  run "${HELPER_PATH} coalesce ${SLAVE1}"
+  log "habilitando adaptive coalescing em ${IFACES[*]}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} coalesce ${s}"; done
 }
 
 apply_offloads() {
   (( APPLY_OFFLOADS )) || { warn "offloads desabilitados (--no-offloads)"; return; }
-  log "habilitando offloads em ambos os slaves (tso/gro/gso=on, lro=off — bond força off)"
+  log "habilitando offloads em ${IFACES[*]} (tso/gro/gso=on, lro=off)"
   # LRO=off explícito: em slave de bond o kernel força off (dev_disable_lro em bond_enslave).
   # Setar off evita o "[requested on]" cosmético; o GRO (software) cobre o papel mantendo os
   # pacotes íntegros, que é o que forwarding exige.
-  run "${HELPER_PATH} offloads ${SLAVE0} off"
-  run "${HELPER_PATH} offloads ${SLAVE1} off"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} offloads ${s} off"; done
 }
 
 # ---------------- qdisc das tx queues (pacing FQ p/ BBR) ----------------
@@ -1073,10 +1152,9 @@ apply_offloads() {
 
 apply_qdisc() {
   (( APPLY_QDISC )) || { warn "regeneração de qdisc desabilitada (--no-qdisc)"; return; }
-  log "verificando qdisc das tx queues em ambos os slaves (pacing FQ p/ BBR)"
+  log "verificando qdisc das tx queues em ${IFACES[*]} (pacing FQ p/ BBR)"
   # O qdisc do bond master é noqueue: o enfileiramento real acontece nos slaves.
-  run "${HELPER_PATH} fix-qdisc ${SLAVE0}"
-  run "${HELPER_PATH} fix-qdisc ${SLAVE1}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} fix-qdisc ${s}"; done
 }
 
 # ---------------- pinning ----------------
@@ -1090,17 +1168,31 @@ apply_control_pin() {
 }
 
 # worker_cpu_affinity auto: o nginx prende o worker N na CPU N (na ordem da máscara do master).
-# Com worker_processes auto (= 48) cada CPU fica com um worker, alinhado à fila N da NIC.
+# Com worker_processes auto (= nproc) cada CPU fica com um worker.
 apply_nginx_affinity() {
   (( APPLY_NGINX )) || return 0
+  # CPUs distintas usadas pelas IRQs (no bond os dois slaves podem dividir o mesmo NUMA).
+  local wp ncpu_nic ncpu_all i all=""
+  for i in "${!IFACES[@]}"; do all+="${all:+,}$(cpus_of "$i")"; done
+  ncpu_nic=$(python3 -c 'import sys
+s=set()
+for t in sys.argv[1].split(","):
+    a,_,b=t.partition("-"); s|=set(range(int(a),int(b or a)+1))
+print(len(s))' "$all")
+  ncpu_all=$(count_cpus_in_list "$(cat /sys/devices/system/cpu/online)")
+  # O nginx.conf do XUI vem com CRLF: tirar o \r junto com o ';'.
+  wp=$(awk '/^[[:space:]]*worker_processes/{gsub(/[;\r]/,"",$2); print $2; exit}' "$NGINX_CONF" 2>/dev/null || true)
+  if [[ "$wp" == auto ]] && (( ncpu_all > ncpu_nic )); then
+    warn "nginx worker_processes=auto => ${ncpu_all} workers em TODAS as CPUs; as IRQs da placa ficam em ${ncpu_nic} (o resto está em outro NUMA)"
+  fi
   log "nginx: worker_cpu_affinity auto em ${NGINX_CONF} (backup + nginx -t + reload gracioso)"
   run "${HELPER_PATH} nginx-affinity ${NGINX_CONF} on"
 }
 
 apply_pinning() {
   log "aplicando IRQ affinity (implementação nativa, via helper)"
-  run "${HELPER_PATH} pin-irq ${SLAVE0} ${SLAVE0_CPUS}"
-  run "${HELPER_PATH} pin-irq ${SLAVE1} ${SLAVE1_CPUS}"
+  local i
+  for i in "${!IFACES[@]}"; do run "${HELPER_PATH} pin-irq ${IFACES[i]} $(cpus_of "$i")"; done
   ok "IRQs pinadas"
 }
 
@@ -1111,8 +1203,7 @@ apply_pinning() {
 
 apply_xps_per_irq() {
   log "XPS per-queue espelhando IRQ (tx-N -> CPU do IRQ TxRx-N)"
-  run "${HELPER_PATH} mirror-xps ${SLAVE0}"
-  run "${HELPER_PATH} mirror-xps ${SLAVE1}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} mirror-xps ${s}"; done
   ok "XPS aplicado"
 }
 
@@ -1121,13 +1212,16 @@ apply_rps_per_irq() {
   # para a própria CPU do IRQ N, então quando há uma fila por CPU não há para onde
   # redistribuir: get_rps_cpu() não tem atalho para "destino == CPU atual" e cada pacote paga
   # enqueue_to_backlog + um ciclo extra de softirq, sem ganho.
-  if (( QUEUES_S0 >= $(count_cpus_in_list "$SLAVE0_CPUS") && QUEUES_S1 >= $(count_cpus_in_list "$SLAVE1_CPUS") )); then
+  local i all_full=1
+  for i in "${!IFACES[@]}"; do
+    (( $(queues_of "$i") >= $(count_cpus_in_list "$(cpus_of "$i")") )) || all_full=0
+  done
+  if (( all_full )); then
     warn "--rps com filas >= CPUs: cada fila já tem CPU própria, RPS só adiciona overhead"
     warn "  (útil quando o nº de filas é MENOR que o de CPUs do cpulist)"
   fi
   log "RPS per-queue espelhando IRQ (rx-N -> CPU do IRQ TxRx-N)"
-  run "${HELPER_PATH} mirror-rps ${SLAVE0}"
-  run "${HELPER_PATH} mirror-rps ${SLAVE1}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} mirror-rps ${s}"; done
   ok "RPS aplicado"
 }
 
@@ -1137,8 +1231,7 @@ apply_arfs_all() {
   # o ATR (--atr on, default do driver).
   log "RFS (software): rps_sock_flow_entries=${ARFS_FLOW_ENTRIES} + rps_flow_cnt=${ARFS_PER_QUEUE_FLOW_CNT}/n_filas"
   run "${HELPER_PATH} arfs-global ${ARFS_FLOW_ENTRIES}"
-  run "${HELPER_PATH} arfs ${SLAVE0} ${ARFS_PER_QUEUE_FLOW_CNT}"
-  run "${HELPER_PATH} arfs ${SLAVE1} ${ARFS_PER_QUEUE_FLOW_CNT}"
+  for s in "${IFACES[@]}"; do run "${HELPER_PATH} arfs ${s} ${ARFS_PER_QUEUE_FLOW_CNT}"; done
   ok "RFS aplicado"
 }
 
@@ -1850,22 +1943,22 @@ write_systemd_unit() {
   local ring_lines="" coalesce_lines="" offload_lines="" atr_lines=""
   if (( APPLY_RING_MAX )); then
     # Um slave por vez, com sleep: ethtool -G no i40e faz down/up da VSI.
-    ring_lines=$'\n# Ring buffer (0 = máximo do device); down/up da VSI no i40e\nExecStart=-'"${HELPER_PATH}"$' ring-max '"${SLAVE0}"$' '"${RING_SIZE}"$'\nExecStart=/bin/sleep '"${BOOT_RESET_SLEEP}"$'\nExecStart=-'"${HELPER_PATH}"$' ring-max '"${SLAVE1}"$' '"${RING_SIZE}"$'\nExecStart=/bin/sleep '"${BOOT_RESET_SLEEP}"
+    ring_lines=$'\n# Ring buffer (0 = máximo do device); down/up da VSI no i40e'"$(unit_lines '-' "ring-max %s ${RING_SIZE}" sleep)"
   fi
   if [[ -n "$ATR_STATE" ]]; then
-    atr_lines=$'\n# Flow Director ATR (--atr)\nExecStart=-'"${HELPER_PATH}"$' atr '"${SLAVE0}"$' '"${ATR_STATE}"$'\nExecStart=-'"${HELPER_PATH}"$' atr '"${SLAVE1}"$' '"${ATR_STATE}"
+    atr_lines=$'\n# Flow Director ATR (--atr)'"$(unit_lines '-' "atr %s ${ATR_STATE}")"
   fi
   if (( APPLY_COALESCE )); then
-    coalesce_lines=$'\n# Coalesce adaptive\nExecStart=-'"${HELPER_PATH}"$' coalesce '"${SLAVE0}"$'\nExecStart=-'"${HELPER_PATH}"$' coalesce '"${SLAVE1}"
+    coalesce_lines=$'\n# Coalesce adaptive'"$(unit_lines '-' "coalesce %s")"
   fi
   if (( APPLY_OFFLOADS )); then
-    offload_lines=$'\n# Offloads tso/gro/gso=on, lro=off (bond force)\nExecStart=-'"${HELPER_PATH}"$' offloads '"${SLAVE0}"$' off\nExecStart=-'"${HELPER_PATH}"$' offloads '"${SLAVE1}"$' off'
+    offload_lines=$'\n# Offloads tso/gro/gso=on, lro=off (fixed off no XL710; bond também força off)'"$(unit_lines '-' "offloads %s off")"
   fi
 
   # Regeneração do qdisc: precisa rodar DEPOIS do último ethtool -L do unit.
   local qdisc_lines=""
   if (( APPLY_QDISC )); then
-    qdisc_lines=$'\n# Qdisc das tx queues: ethtool -L deixa filas novas em pfifo_fast (sem pacing FQ)\nExecStart=-'"${HELPER_PATH}"$' fix-qdisc '"${SLAVE0}"$'\nExecStart=-'"${HELPER_PATH}"$' fix-qdisc '"${SLAVE1}"
+    qdisc_lines=$'\n# Qdisc das tx queues: ethtool -L deixa filas novas em pfifo_fast (sem pacing FQ)'"$(unit_lines '-' "fix-qdisc %s")"
   fi
 
   local xps_lines="" rps_lines="" arfs_lines="" control_lines="" nginx_lines=""
@@ -1877,33 +1970,43 @@ write_systemd_unit() {
     nginx_lines=$'\n# nginx worker_cpu_affinity auto (--nginx-affinity)\nExecStart=-'"${HELPER_PATH}"$' nginx-affinity '"${NGINX_CONF}"$' on'
   fi
   if (( APPLY_XPS )); then
-    xps_lines=$'\n# XPS per-queue espelhando IRQ (--xps)\nExecStart=-'"${HELPER_PATH}"$' mirror-xps '"${SLAVE0}"$'\nExecStart=-'"${HELPER_PATH}"$' mirror-xps '"${SLAVE1}"
+    xps_lines=$'\n# XPS per-queue espelhando IRQ (--xps)'"$(unit_lines '-' "mirror-xps %s")"
   fi
   if (( APPLY_RPS )); then
-    rps_lines=$'\n# RPS per-queue espelhando IRQ (--rps)\nExecStart=-'"${HELPER_PATH}"$' mirror-rps '"${SLAVE0}"$'\nExecStart=-'"${HELPER_PATH}"$' mirror-rps '"${SLAVE1}"
+    rps_lines=$'\n# RPS per-queue espelhando IRQ (--rps)'"$(unit_lines '-' "mirror-rps %s")"
   fi
   if (( APPLY_ARFS )); then
-    arfs_lines=$'\n# RFS (software) global + per-iface (--rfs)\nExecStart=-'"${HELPER_PATH}"$' arfs-global '"${ARFS_FLOW_ENTRIES}"$'\nExecStart=-'"${HELPER_PATH}"$' arfs '"${SLAVE0}"$' '"${ARFS_FLOW_ENTRIES}"$'\nExecStart=-'"${HELPER_PATH}"$' arfs '"${SLAVE1}"$' '"${ARFS_FLOW_ENTRIES}"
+    arfs_lines=$'\n# RFS (software) global + per-iface (--rfs)\nExecStart=-'"${HELPER_PATH}"$' arfs-global '"${ARFS_FLOW_ENTRIES}""$(unit_lines '-' "arfs %s ${ARFS_PER_QUEUE_FLOW_CNT}")"
   fi
 
-  local dev0 dev1
-  dev0=$(netdev_unit "$SLAVE0"); dev1=$(netdev_unit "$SLAVE1")
+  local devs="" conds="" s i cleanup_lines="" queue_lines="" pin_lines=""
+  for s in "${IFACES[@]}"; do
+    devs+=" $(netdev_unit "$s")"
+    conds+=$'\n'"ConditionPathExists=/sys/class/net/${s}"
+  done
+  cleanup_lines=$(unit_lines '-' "cleanup %s"); cleanup_lines="${cleanup_lines#$'\n'}"
+  for i in "${!IFACES[@]}"; do
+    queue_lines+=$'\n'"ExecStart=-${ethtool_bin} -L ${IFACES[i]} combined $(queues_of "$i")"$'\n'"ExecStart=/bin/sleep ${BOOT_RESET_SLEEP}"
+    pin_lines+=$'\n'"ExecStart=${HELPER_PATH} pin-irq ${IFACES[i]} $(cpus_of "$i")"
+  done
+  conds="${conds#$'\n'}"; queue_lines="${queue_lines#$'\n'}"; pin_lines="${pin_lines#$'\n'}"
 
   cat > "${SYSTEMD_UNIT}" <<EOF
 [Unit]
-Description=Intel XL710 (i40e) NIC tuning: ${features} pin (${SLAVE0}=${SLAVE0_CPUS}/q=${QUEUES_S0}, ${SLAVE1}=${SLAVE1_CPUS}/q=${QUEUES_S1})
+Description=Intel XL710 (i40e) NIC tuning [$( (( SINGLE )) && echo single || echo "bond ${BOND}")]: ${features} pin ($(ifaces_summary all))
 After=network-online.target
 Wants=network-online.target
 # As netdevs precisam existir antes de ethtool -L / pin-irq. network-online.target sozinho
 # não garante isso quando quem satisfaz o target é o ifupdown e quem enslava é outro serviço.
-After=${dev0} ${dev1}
+After=${devs# }
+# O reset da PF do boot (ethtool -L/-G) deve acontecer antes do XUI servir tráfego.
+Before=xuione.service
 # irqbalance repina IRQs; se ele voltar (reinstalação, dependência), não pode correr junto.
 Conflicts=irqbalance.service
 After=irqbalance.service
 # A unit Mellanox, se existir de um deploy antigo, pinaria IRQs que não existem aqui.
 Conflicts=mlx-irq-pin.service
-ConditionPathExists=/sys/class/net/${SLAVE0}
-ConditionPathExists=/sys/class/net/${SLAVE1}
+${conds}
 # Assert (não Condition): helper ausente deve virar unit 'failed' e visível, não um skip mudo.
 AssertPathExists=${HELPER_PATH}
 
@@ -1912,18 +2015,13 @@ Type=oneshot
 RemainAfterExit=yes
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # 1) CLEANUP: IRQ smp_affinity -> default, rps/xps/rps_flow_cnt = 0 (ntuple intocado)
-ExecStart=-${HELPER_PATH} cleanup ${SLAVE0}
-ExecStart=-${HELPER_PATH} cleanup ${SLAVE1}
+${cleanup_lines}
 # 2) combined no target por slave (renumera IRQs; precede o pinning). Reset da PF no i40e:
 #    um slave por vez, com sleep para o LACP religar antes do próximo.
-ExecStart=-${ethtool_bin} -L ${SLAVE0} combined ${QUEUES_S0}
-ExecStart=/bin/sleep ${BOOT_RESET_SLEEP}
-ExecStart=-${ethtool_bin} -L ${SLAVE1} combined ${QUEUES_S1}
-ExecStart=/bin/sleep ${BOOT_RESET_SLEEP}${ring_lines}${coalesce_lines}${offload_lines}${atr_lines}${qdisc_lines}
+${queue_lines}${ring_lines}${coalesce_lines}${offload_lines}${atr_lines}${qdisc_lines}
 # 3) Pinning das IRQs TxRx — sem '-': é o objetivo do unit, e o que vem depois
 #    (xps/rps) espelha a afinidade que ele define.
-ExecStart=${HELPER_PATH} pin-irq ${SLAVE0} ${SLAVE0_CPUS}
-ExecStart=${HELPER_PATH} pin-irq ${SLAVE1} ${SLAVE1_CPUS}${xps_lines}${rps_lines}${arfs_lines}${control_lines}${nginx_lines}
+${pin_lines}${xps_lines}${rps_lines}${arfs_lines}${control_lines}${nginx_lines}
 
 [Install]
 WantedBy=multi-user.target
@@ -1949,12 +2047,8 @@ do_rollback() {
     run "rm -f ${SYSTEMD_UNIT}"
     run "systemctl daemon-reload"
   fi
-  if systemctl cat irqbalance.service &>/dev/null; then
-    run "systemctl enable --now irqbalance || true"
-    ok "irqbalance reativado"
-  fi
   log "restaurando combined queues para o default do i40e (min(CPUs online, max)) em cada slave"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     local defq was_up
     defq=$(ethtool_combined_default "$s")
     [[ -n "$defq" ]] || continue
@@ -1963,14 +2057,17 @@ do_rollback() {
       continue
     fi
     was_up=0; slave_in_bond_up "$s" && was_up=1
+    if (( SINGLE && was_up && ! ALLOW_SINGLE_LINK )); then
+      warn "$s fica em Combined=$(ethtool_combined_current "$s"): voltar a ${defq} reseta a placa única (queda). Para isso: --rollback --allow-single-link"
+      continue
+    fi
     run "ethtool -L $s combined ${defq}"
     wait_slave_back "$s" "$was_up"
   done
   # Limpa RPS/XPS/aRFS/IRQ smp_affinity usando o helper (se ainda presente).
   if [[ -x "${HELPER_PATH}" ]]; then
     log "rollback: limpando RPS/XPS/RFS via helper"
-    run "${HELPER_PATH} cleanup ${SLAVE0}"
-    run "${HELPER_PATH} cleanup ${SLAVE1}"
+    for s in "${IFACES[@]}"; do run "${HELPER_PATH} cleanup ${s}"; done
     run "${HELPER_PATH} cleanup-global"
     run "${HELPER_PATH} unpin-control"
     # A linha do nginx é marcada: remove só se foi este script que pôs (independe da flag).
@@ -1980,8 +2077,7 @@ do_rollback() {
     # Voltar as filas ao máximo (acima) reexpõe filas com pfifo_fast — regenerar antes de
     # remover o helper devolve o net.core.default_qdisc em todas elas.
     if (( APPLY_QDISC )); then
-      run "${HELPER_PATH} fix-qdisc ${SLAVE0}"
-      run "${HELPER_PATH} fix-qdisc ${SLAVE1}"
+      for s in "${IFACES[@]}"; do run "${HELPER_PATH} fix-qdisc ${s}"; done
     fi
     # Defensivo: se alguma outra unit passou a usar este helper, não removê-lo.
     if grep -rlsF -- "${HELPER_PATH}" /etc/systemd/system/ >/dev/null 2>&1; then
@@ -1994,6 +2090,11 @@ do_rollback() {
     warn "helper ausente — limpe manualmente RPS/XPS/aRFS:"
     warn "  for q in /sys/class/net/${SLAVE0:-<slave0>}/queues/{rx,tx}-*/{rps,xps}_cpus; do echo 0 > \$q 2>/dev/null; done"
     warn "  sysctl -w net.core.rps_sock_flow_entries=0"
+  fi
+  # irqbalance por último: religado antes do cleanup ele competiria pela afinidade.
+  if systemctl cat irqbalance.service &>/dev/null; then
+    run "systemctl enable --now irqbalance || true"
+    ok "irqbalance reativado"
   fi
   echo
   warn "o rollback NÃO reverte (por design, são estados benignos):"
@@ -2088,8 +2189,8 @@ validate() {
     log "VALIDAÇÃO"
   fi
 
-  report_affinity "$SLAVE0" "$SLAVE0_CPUS"
-  report_affinity "$SLAVE1" "$SLAVE1_CPUS"
+  local i
+  for i in "${!IFACES[@]}"; do report_affinity "${IFACES[i]}" "$(cpus_of "$i")"; done
 
   echo "── IRQs de controle (esperado: CPUs ${CONTROL_CPUS}$( (( APPLY_CONTROL_PIN )) || echo ', mas --no-control-pin')) ──"
   local cl_total=0 cl_in=0 irq name aff
@@ -2139,9 +2240,9 @@ validate() {
   echo "── helper / scripts ──"
   printf "  helper: %s (exec=%s)\n" "$HELPER_PATH" "$([[ -x "$HELPER_PATH" ]] && echo yes || echo no)"
 
-  echo "── combined queues por slave ──"
+  echo "── combined queues por interface ──"
   local q e s
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     q=$(ethtool_combined_current "$s")
     if (( ROLLBACK )); then e=$(ethtool_combined_max "$s"); else
       [[ "$s" == "$SLAVE0" ]] && e="$QUEUES_S0" || e="$QUEUES_S1"; fi
@@ -2151,7 +2252,7 @@ validate() {
 
   echo "── ring buffer (alvo $( (( APPLY_RING_MAX )) && echo "${RING_SIZE/#0/máximo}" || echo 'intocado: --no-ring')) vs máximo do device ──"
   local rr tr rmx tmx
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     local rt
     rr=$(ethtool_ring "$s" current RX); tr=$(ethtool_ring "$s" current TX)
     rmx=$(ethtool_ring "$s" max RX);     tmx=$(ethtool_ring "$s" max TX)
@@ -2176,8 +2277,8 @@ validate() {
 
   # XPS: o i40e só auto-popula xps_cpus na primeira configuração da fila; depois do cleanup,
   # sem --xps, o esperado é zero (o kernel escolhe a tx queue por hash).
-  echo "── RPS / XPS / RFS por slave (RPS=$( (( APPLY_RPS )) && echo pedido || echo off), XPS=$( (( APPLY_XPS )) && echo 'espelha IRQ' || echo off), RFS=$( (( APPLY_ARFS )) && echo pedido || echo off)) ──"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  echo "── RPS / XPS / RFS por interface (RPS=$( (( APPLY_RPS )) && echo pedido || echo off), XPS=$( (( APPLY_XPS )) && echo 'espelha IRQ' || echo off), RFS=$( (( APPLY_ARFS )) && echo pedido || echo off)) ──"
+  for s in "${IFACES[@]}"; do
     local nz_rps nz_xps xps_sample rps_sample arfs_state arfs_flow
     # `; true` no fim do loop garante que o subshell retorne 0 — sem isso, se a última
     # iter tem `[[ -n "$v" ]] && echo nz` em falso, pipefail propaga 1 e `set -e` aborta.
@@ -2203,7 +2304,7 @@ validate() {
     "$((APPLY_ARFS ? ARFS_FLOW_ENTRIES : 0))"
 
   echo "── coalesce adaptive ──"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     # ethtool -c imprime "Adaptive RX: on  TX: on" em uma única linha.
     ethtool -c "$s" 2>/dev/null | awk -v iface="$s" '/^Adaptive RX:/ {
       printf "  %s: RX=%s TX=%s\n", iface, $3, $5
@@ -2211,7 +2312,7 @@ validate() {
   done
 
   echo "── offloads ──"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     echo "  ${s}:"
     ethtool -k "$s" 2>/dev/null | awk -F: '
       /^(tcp-segmentation-offload|generic-receive-offload|generic-segmentation-offload|large-receive-offload):/ {
@@ -2224,7 +2325,7 @@ validate() {
     "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')" \
     "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
   if command -v tc >/dev/null; then
-    for s in "$BOND" "$SLAVE0" "$SLAVE1"; do
+    for s in $( (( SINGLE )) || echo "$BOND") "${IFACES[@]}"; do
       printf "  %-18s root=%-10s filas: %s\n" "$s" \
         "$(qdisc_root_kind_v "$s")" "$(qdisc_hist_v "$s")"
     done
@@ -2233,7 +2334,7 @@ validate() {
   fi
 
   echo "── drops nas NICs (devem ficar estáveis após pinning) ──"
-  for s in "$SLAVE0" "$SLAVE1"; do
+  for s in "${IFACES[@]}"; do
     echo "  $s:"
     ethtool -S "$s" 2>/dev/null | grep -E "^ +(rx_dropped|rx_missed_errors|tx_busy|rx_alloc_fail|rx_pg_alloc_fail|port\.rx_discards|port\.rx_dropped|port\.tx_dropped_link_down):" | sed 's/^/  /' || true
   done
@@ -2248,7 +2349,7 @@ main() {
   if (( PRINT_HELPER )); then emit_helper; exit 0; fi
   if (( PRINT_TOPOLOGY )); then print_topology; exit 0; fi
 
-  log "intel-xl710-tune-bond.sh — Bloco A do plano de pinning (i40e)"
+  log "intel-xl710-tune-bond.sh — Bloco A do plano de pinning (i40e, bond ou placa única)"
   (( DRY_RUN )) && warn "DRY-RUN ATIVO: nada será escrito"
   log "flags: XPS=$((APPLY_XPS)) RPS=$((APPLY_RPS)) RFS=$((APPLY_ARFS)) ATR=${ATR_STATE:-intocado} ring=$( (( APPLY_RING_MAX )) && echo "${RING_SIZE/#0/max}" || echo off)"
 
@@ -2286,10 +2387,9 @@ main() {
   echo
   ok "Bloco A aplicado (ou simulado, se --dry-run)."
   echo "  Próxima ação sugerida: observar 1–2h"
-  echo "    watch -d 'grep -E \"i40e-(${SLAVE0}|${SLAVE1})-TxRx\" /proc/interrupts | head'"
-  echo "    ethtool -S ${SLAVE0} | grep -E 'port.rx_discards|rx_dropped|rx_missed'"
-  echo "    ethtool -S ${SLAVE1} | grep -E 'port.rx_discards|rx_dropped|rx_missed'"
-  echo "  Rollback:  $0 --rollback"
+  echo "    watch -d 'grep -E \"i40e-($(IFS='|'; echo "${IFACES[*]}"))-TxRx\" /proc/interrupts | head'"
+  for s in "${IFACES[@]}"; do echo "    ethtool -S ${s} | grep -E 'port.rx_discards|rx_dropped|rx_missed'"; done
+  echo "  Rollback:  $0 $( (( SINGLE )) && echo "--nic ${SLAVE0} ")--rollback"
 }
 
 main "$@"
